@@ -49,7 +49,7 @@ class DiffusersLTX2Refiner(nn.Module):
         *,
         dtype: torch.dtype,
         device: torch.device | str,
-        text_max_sequence_length: int = 1024,
+        text_max_sequence_length: int = 256,
     ) -> None:
         super().__init__()
         self.refiner_root = Path(refiner_root)
@@ -95,7 +95,7 @@ class DiffusersLTX2Refiner(nn.Module):
         _empty_cuda_cache()
         prompt_embeds, prompt_attention_mask = self._encode_prompt(prompt)
 
-        self.transformer.to(self.device)
+        self._move_transformer_static_modules(self.device)
         z = sana_latent.to(device=self.device, dtype=self.dtype)
         sigmas = torch.tensor(STAGE_2_DISTILLED_SIGMA_VALUES, dtype=torch.float32, device=self.device)
         start_sigma = float(sigmas[0])
@@ -168,14 +168,14 @@ class DiffusersLTX2Refiner(nn.Module):
         text_encoder.to(self.device)
         text_backbone = getattr(text_encoder, "model", text_encoder)
         outputs = text_backbone(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
-        hidden_states = torch.stack(outputs.hidden_states, dim=-1)
-        sequence_lengths = attention_mask.sum(dim=-1)
+        hidden_states = torch.stack([state.to("cpu") for state in outputs.hidden_states], dim=-1)
+        sequence_lengths = attention_mask.sum(dim=-1).to("cpu")
         prompt_embeds = _pack_text_embeds(
             hidden_states,
             sequence_lengths,
-            device=self.device,
+            device="cpu",
             padding_side=tokenizer.padding_side,
-        ).to(dtype=self.dtype)
+        ).to(device=self.device, dtype=self.dtype)
 
         del text_encoder, text_backbone, outputs, hidden_states
         _empty_cuda_cache()
@@ -189,6 +189,15 @@ class DiffusersLTX2Refiner(nn.Module):
         return connector_prompt_embeds.to(device=self.device, dtype=self.dtype), connector_attention_mask.to(
             device=self.device
         )
+
+    def _move_transformer_static_modules(self, device: torch.device | str) -> None:
+        """Move only non-block LTX-2 modules needed around the streamed blocks."""
+        transformer = self.transformer
+        for module_name in ("rope", "proj_in", "time_embed", "caption_projection", "norm_out", "proj_out"):
+            module = getattr(transformer, module_name, None)
+            if module is not None:
+                module.to(device)
+        transformer.scale_shift_table.data = transformer.scale_shift_table.data.to(device)
 
     def _predict_current_x0(
         self,
@@ -269,6 +278,7 @@ class DiffusersLTX2Refiner(nn.Module):
         encoder_hidden_states = encoder_hidden_states.view(batch_size, -1, hidden_states.size(-1))
 
         for block in transformer.transformer_blocks:
+            block.to(hidden_states.device)
             hidden_states = _forward_video_block(
                 block=block,
                 hidden_states=hidden_states,
@@ -278,6 +288,8 @@ class DiffusersLTX2Refiner(nn.Module):
                 encoder_attention_mask=encoder_attention_mask,
                 n_context_tokens=n_context_tokens,
             )
+            block.to("cpu")
+            _empty_cuda_cache()
 
         scale_shift_values = transformer.scale_shift_table[None, None] + embedded_timestep[:, :, None]
         shift, scale = scale_shift_values[:, :, 0], scale_shift_values[:, :, 1]
