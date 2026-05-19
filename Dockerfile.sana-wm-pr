@@ -1,0 +1,31 @@
+FROM sana-wm:local
+
+WORKDIR /workspace
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.12-dev \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install \
+    pyrallis \
+    omegaconf \
+    termcolor \
+    einops \
+    opencv-python \
+    "imageio[ffmpeg]" \
+    moviepy \
+    ftfy \
+    timm==0.6.13 \
+    webdataset \
+    tensorboardX \
+    beautifulsoup4 \
+    bs4 \
+    transformers==4.57.3 \
+    "diffusers>=0.37.0" \
+    liger_kernel \
+    "flash-linear-attention>=0.4.2"
+
+RUN pip install --no-build-isolation mmcv==1.7.2
+
+RUN pip install pytz qwen-vl-utils scipy
