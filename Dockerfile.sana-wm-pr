@@ -29,3 +29,7 @@ RUN pip install \
 RUN pip install --no-build-isolation mmcv==1.7.2
 
 RUN pip install pytz qwen-vl-utils scipy
+
+# Pi3X estimates camera intrinsics when --intrinsics is omitted.
+# Install without dependencies so it does not downgrade the pinned torch stack.
+RUN pip install git+https://github.com/yyfz/Pi3.git --no-deps

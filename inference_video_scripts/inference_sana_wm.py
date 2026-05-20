@@ -337,9 +337,11 @@ def estimate_intrinsics_with_pi3x(image: Image.Image, device: torch.device, logg
         )
 
     # Free Pi3X memory before the heavy models load.
-    del model, out, K_model, rays_d, tensor
+    model.to("cpu")
+    del model, out, K_model, K_model_np, rays_d, tensor, resized
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
     gc.collect()
     return np.array([fx, fy, cx, cy], dtype=np.float32)
 

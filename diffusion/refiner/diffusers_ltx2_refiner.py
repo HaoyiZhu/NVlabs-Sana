@@ -175,11 +175,12 @@ class DiffusersLTX2Refiner(nn.Module):
             sequence_lengths,
             device="cpu",
             padding_side=tokenizer.padding_side,
-        ).to(device=self.device, dtype=self.dtype)
+        ).to(dtype=self.dtype)
 
         del text_encoder, text_backbone, outputs, hidden_states
         _empty_cuda_cache()
 
+        prompt_embeds = prompt_embeds.to(device=self.device, dtype=self.dtype)
         self.connectors.to(self.device)
         connector_prompt_embeds, _, connector_attention_mask = self.connectors(prompt_embeds, attention_mask)
         self.connectors.to("cpu")
