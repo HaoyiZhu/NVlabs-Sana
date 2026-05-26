@@ -226,7 +226,9 @@ def torch_chunk_cam_single_path_delta_rule(
     beta: torch.Tensor,
     decay: torch.Tensor,
     chunk_size: int | None = 21,
-) -> torch.Tensor:
+    S_kv_init: torch.Tensor | None = None,
+    return_state: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Parallel chunk-scan version of the single-path delta-rule recurrence.
 
     Algebraically equivalent to ``torch_recurrent_cam_single_path_delta_rule``
@@ -286,7 +288,7 @@ def torch_chunk_cam_single_path_delta_rule(
     W_kv_c = W_kv.split(split_sizes, dim=2)
     U_kv_c = U_kv.split(split_sizes, dim=2)
 
-    S_kv = torch.zeros(B, H, D, D, device=q_rot.device, dtype=q_rot.dtype)
+    S_kv = S_kv_init if S_kv_init is not None else torch.zeros(B, H, D, D, device=q_rot.device, dtype=q_rot.dtype)
     out_S_kv: list[torch.Tensor] = []
 
     def _chunk_scan_kv(w_kv: torch.Tensor, u_kv: torch.Tensor, s_kv: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -308,7 +310,10 @@ def torch_chunk_cam_single_path_delta_rule(
     # =========================================================================
     out = torch.matmul(S_kv_all, q_rot)  # (B, H, T, D, S)
 
-    return out.permute(0, 1, 3, 2, 4).reshape(B, H, D, N)
+    out_flat = out.permute(0, 1, 3, 2, 4).reshape(B, H, D, N)
+    if return_state:
+        return out_flat, S_kv
+    return out_flat
 
 
 class _GDNUCPEBase(GDN):
@@ -878,11 +883,15 @@ class _GDNUCPEBase(GDN):
         v: torch.Tensor,
         beta: torch.Tensor,
         decay: torch.Tensor,
-    ) -> torch.Tensor:
+        S_kv_init: torch.Tensor | None = None,
+        return_state: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Run the numerator-only camera delta-rule recurrence.
 
         Dispatches to either the recurrent reference or the parallel chunk
-        scan depending on ``cam_update_rule_func`` set at init time.
+        scan depending on ``cam_update_rule_func`` set at init time. When
+        ``return_state`` is set, also returns the final ``(B, H, D, D)`` state
+        for sliding-window cached inference.
         """
         if getattr(self, "fp32_attention", True):
             q_rot = q_rot.float()
@@ -890,7 +899,14 @@ class _GDNUCPEBase(GDN):
             v = v.float()
             beta = beta.float()
             decay = decay.float()
-        return self._cam_single_path_fn(q_rot, k_rot, v, beta, decay)
+            if S_kv_init is not None:
+                S_kv_init = S_kv_init.float()
+        extra_kwargs: dict = {}
+        if S_kv_init is not None:
+            extra_kwargs["S_kv_init"] = S_kv_init
+        if return_state:
+            extra_kwargs["return_state"] = True
+        return self._cam_single_path_fn(q_rot, k_rot, v, beta, decay, **extra_kwargs)
 
     # ------------------------------------------------------------------
     # Camera-branch forward (forward-only causal -- default)

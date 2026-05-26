@@ -431,11 +431,21 @@ class SanaVideoMSCamCtrlBlock(nn.Module):
         if chunk_size is not None:
             self_attn_kwargs["chunk_size"] = chunk_size
 
+        save_kv_cache = kwargs.get("save_kv_cache", None)
+        if save_kv_cache is not None:
+            self_attn_kwargs["save_kv_cache"] = save_kv_cache
+        kv_cache = kwargs.get("kv_cache", None)
+        if kv_cache is not None:
+            self_attn_kwargs["kv_cache"] = kv_cache
+
         x_norm1 = self.norm1(x).reshape(B, num_frames, -1, C)
         x_msa_in = t2i_modulate(x_norm1, shift_msa, scale_msa).reshape(B, N, C)
         if frame_token_mask is not None:
             x_msa_in = x_msa_in * frame_token_mask
-        attn_out = self.attn(x_msa_in, **self_attn_kwargs).reshape(B, num_frames, -1, C)
+        attn_out_raw = self.attn(x_msa_in, **self_attn_kwargs)
+        if kv_cache is not None:
+            attn_out_raw, kv_cache = attn_out_raw
+        attn_out = attn_out_raw.reshape(B, num_frames, -1, C)
         attn_out = (gate_msa * attn_out).reshape(B, N, C)
         if frame_token_mask is not None:
             attn_out = attn_out * frame_token_mask
@@ -480,11 +490,19 @@ class SanaVideoMSCamCtrlBlock(nn.Module):
         if chunk_size is not None:
             mlp_kwargs["chunk_size"] = chunk_size
 
+        if save_kv_cache is not None:
+            mlp_kwargs["save_kv_cache"] = save_kv_cache
+        if kv_cache is not None:
+            mlp_kwargs["kv_cache"] = kv_cache
+
         x_norm2 = self.norm2(x).reshape(B, num_frames, -1, C)
         x_mlp_in = t2i_modulate(x_norm2, shift_mlp, scale_mlp).reshape(B, N, C)
         if frame_token_mask is not None:
             x_mlp_in = x_mlp_in * frame_token_mask
-        mlp_out = self.mlp(x_mlp_in, **mlp_kwargs).reshape(B, num_frames, -1, C)
+        mlp_out_raw = self.mlp(x_mlp_in, **mlp_kwargs)
+        if kv_cache is not None:
+            mlp_out_raw, kv_cache = mlp_out_raw
+        mlp_out = mlp_out_raw.reshape(B, num_frames, -1, C)
         mlp_out = (gate_mlp * mlp_out).reshape(B, N, C)
         if frame_token_mask is not None:
             mlp_out = mlp_out * frame_token_mask
@@ -492,6 +510,8 @@ class SanaVideoMSCamCtrlBlock(nn.Module):
         if frame_token_mask is not None:
             x = x * frame_token_mask
 
+        if kv_cache is not None:
+            return x, kv_cache
         return x
 
     def forward(self, x, y, t, mask=None, THW=None, rotary_emb=None, block_mask=None, chunk_index=None, **kwargs):
@@ -558,6 +578,15 @@ class SanaVideoMSCamCtrlBlock(nn.Module):
         if chunk_size is not None:
             self_attn_kwargs["chunk_size"] = chunk_size
 
+        save_kv_cache = kwargs.get("save_kv_cache", None)
+        if save_kv_cache is not None:
+            self_attn_kwargs["save_kv_cache"] = save_kv_cache
+        kv_cache = kwargs.get("kv_cache", None)
+        if kv_cache is not None:
+            self_attn_kwargs["kv_cache"] = kv_cache
+        x_sa = self.attn(x_sa_in, **self_attn_kwargs)
+        if kv_cache is not None:
+            x_sa, kv_cache = x_sa
         if frame_token_mask is not None:
             x_sa = x_sa * frame_token_mask
 
@@ -607,6 +636,16 @@ class SanaVideoMSCamCtrlBlock(nn.Module):
         if chunk_size is not None:
             mlp_kwargs["chunk_size"] = chunk_size
 
+        if save_kv_cache is not None:
+            mlp_kwargs["save_kv_cache"] = save_kv_cache
+        if kv_cache is not None:
+            mlp_kwargs["kv_cache"] = kv_cache
+        x_mlp_in = t2i_modulate(self.norm2(x), shift_mlp, scale_mlp)
+        if frame_token_mask is not None:
+            x_mlp_in = x_mlp_in * frame_token_mask
+        mlp_out = self.mlp(x_mlp_in, **mlp_kwargs)
+        if kv_cache is not None:
+            mlp_out, kv_cache = mlp_out
         if frame_token_mask is not None:
             mlp_out = mlp_out * frame_token_mask
         x = x + self.drop_path(gate_mlp * mlp_out)
@@ -617,6 +656,9 @@ class SanaVideoMSCamCtrlBlock(nn.Module):
 
         if self.block_hook is not None:
             self.block_hook(**intermediate_feats)
+
+        if kv_cache is not None:
+            return x, kv_cache
 
         return x
 

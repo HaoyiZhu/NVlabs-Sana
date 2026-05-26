@@ -208,6 +208,9 @@ def torch_chunk_sana_gdn(
     chunk_size: int | None = 21,
     eps: float = 1e-6,
     return_components: bool = False,
+    S_kv_init: torch.Tensor | None = None,
+    S_z_init: torch.Tensor | None = None,
+    return_state: bool = False,
 ):
     del recall_gate  # Currently unused; kept for API parity.
 
@@ -269,8 +272,8 @@ def torch_chunk_sana_gdn(
     # 3. FAST INTRA-CHUNK SCAN OVER DxD SPACE
     # =========================================================================
 
-    S_kv = torch.zeros(B, H, D, D, device=q.device, dtype=q.dtype)
-    S_z = torch.zeros(B, H, D, 1, device=q.device, dtype=q.dtype)
+    S_kv = S_kv_init if S_kv_init is not None else torch.zeros(B, H, D, D, device=q.device, dtype=q.dtype)
+    S_z = S_z_init if S_z_init is not None else torch.zeros(B, H, D, 1, device=q.device, dtype=q.dtype)
 
     out_S_kv = []
     out_S_z = []
@@ -306,8 +309,12 @@ def torch_chunk_sana_gdn(
     final_num = restore_shape(out_num, D)
     final_den = restore_shape(out_den, 1)
 
+    if return_components and return_state:
+        return final_num, final_den, S_kv, S_z
     if return_components:
         return final_num, final_den
+    if return_state:
+        return final_num / (final_den + eps), S_kv, S_z
 
     return final_num / (final_den + eps)
 

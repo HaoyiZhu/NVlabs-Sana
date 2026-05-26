@@ -38,6 +38,7 @@ import gc
 import logging
 import math
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -142,16 +143,28 @@ class GenerationParams:
     sink_token: bool = False
     num_frame_per_block: int = 3
     denoising_step_list: list[int] | None = None
+    # When the refiner is enabled, additionally Sana-VAE-decode the unrefined
+    # stage-1 latent so callers can compare stage-1 against refined output.
+    save_stage1: bool = False
 
 
 @dataclass
 class RefinerSettings:
-    """LTX-2 sink-bidirectional Euler refiner configuration."""
+    """LTX-2 refiner configuration.
+
+    ``block_size`` controls the inference mode: ``None`` (default) keeps the
+    legacy single-shot sink-bidirectional Euler path; setting ``block_size``
+    (canonical: 3) enables chunk-causal AR with a sliding KV window of
+    ``kv_max_frames`` context frames, matching tian's
+    ``run_reforcing_inference`` ``distilled-3step + source-sink-1`` recipe.
+    """
 
     root: Path | str
     gemma_root: Path | str
     sink_size: int = 1
     seed: int = 42
+    block_size: int | None = None
+    kv_max_frames: int = 11
 
 
 # ============================================================================
@@ -669,6 +682,14 @@ class SanaWMPipeline:
 
         sana_latent = self._sample_stage1(image, prompt, camera, params, latent_T, latent_h, latent_w)
 
+        # When the refiner is enabled, optionally decode the unrefined stage-1
+        # latent with the Sana VAE first so the caller can compare both paths.
+        # We must do this BEFORE ``_refine``, which offloads stage-1 components
+        # when ``offload_refiner`` is set.
+        stage1_video = None
+        if self.refiner_settings is not None and params.save_stage1:
+            stage1_video = self._decode_with_sana_vae(sana_latent)
+
         if self.refiner_settings is not None:
             video = self._refine(sana_latent, prompt, params, self.refiner_settings)
             # _refine drops the sink anchor frame; realign the trajectory.
@@ -677,7 +698,12 @@ class SanaWMPipeline:
             video = self._decode_with_sana_vae(sana_latent)
             video_c2w = c2w[: params.num_frames]
 
-        return {"video": video, "c2w": video_c2w, "latent": sana_latent.cpu()}
+        result: dict[str, object] = {"video": video, "c2w": video_c2w, "latent": sana_latent.cpu()}
+        if stage1_video is not None:
+            result["stage1_video"] = stage1_video
+            # stage-1 covers all ``num_frames`` frames; refined drops frame 0.
+            result["stage1_c2w"] = c2w[: params.num_frames]
+        return result
 
     # ------- stage 1: Sana DiT -------
 
@@ -766,6 +792,9 @@ class SanaWMPipeline:
             model_kwargs["chunk_index"] = chunk_index
 
         flow_shift = self._resolve_flow_shift(params.flow_shift)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
         samples = self._dispatch_solver(
             params.sampling_algo,
             z,
@@ -779,6 +808,10 @@ class SanaWMPipeline:
             generator,
             params,
         )
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        self.logger.info(f"[timing] stage1 sample: {time.perf_counter() - t0:.3f}s "
+                         f"(latent shape {tuple(samples.shape)})")
         torch.cuda.empty_cache()
         return samples.detach()
 
@@ -863,7 +896,14 @@ class SanaWMPipeline:
         if self.offload_vae:
             self.vae.to(self.device)
         samples = sana_latent.to(device=self.device, dtype=self.vae_dtype)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
         decoded = vae_decode(self.config.vae.vae_type, self.vae, samples)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        self.logger.info(f"[timing] vae decode: {time.perf_counter() - t0:.3f}s "
+                         f"(latent T={sana_latent.shape[2]} -> pixels {tuple(decoded.shape)})")
         if isinstance(decoded, list):
             decoded = torch.stack(decoded, dim=0)
         video = (
@@ -897,6 +937,8 @@ class SanaWMPipeline:
             sink_size=int(refiner.sink_size),
             seed=int(refiner.seed),
             progress=True,
+            block_size=refiner.block_size,
+            kv_max_frames=int(refiner.kv_max_frames),
         )
         if self.offload_refiner:
             self._release_refiner()
@@ -910,6 +952,219 @@ class SanaWMPipeline:
         torch.cuda.empty_cache()
         gc.collect()
         return video
+
+    @torch.inference_mode()
+    def generate_streaming(
+        self,
+        image: "Image.Image",
+        prompt: str,
+        c2w: torch.Tensor,
+        intrinsics_vec4: torch.Tensor,
+        params: GenerationParams,
+        *,
+        output_path: str | Path,
+        streaming_crf: int = 18,
+        streaming_preset: str = "medium",
+    ) -> dict[str, object]:
+        """Chunk-pipelined interactive generation.
+
+        Runs stage-1 sampling, refiner AR blocks, and causal-VAE decode on
+        three CUDA streams, emitting one 24-pixel-frame chunk to a progressive
+        MP4 per AR block. Requires:
+
+        * The ``vae_type`` to be ``LTX2VAE_diffusers_causal`` (this is set up by
+          ``--use_causal_vae``).
+        * The refiner to be configured with ``block_size`` set
+          (``--refiner_block_size 3``).
+        * ``sampling_algo=self_forcing`` (stage-1 chunk emission requires the
+          self-forcing solver's ``sample_chunks`` generator).
+
+        Args:
+            image: Crop-aligned first-frame RGB image (704x1280).
+            prompt: Text prompt.
+            c2w: Camera-to-world matrices (F, 4, 4) for ``num_frames`` frames.
+            intrinsics_vec4: Per-frame ``[fx, fy, cx, cy]`` (F, 4).
+            params: GenerationParams.
+            output_path: Destination MP4 file.
+            streaming_crf: ffmpeg CRF for the writer.
+            streaming_preset: ffmpeg libx264 preset.
+
+        Returns:
+            Dict with ``output_path``, ``n_pixel_frames``, ``c2w`` (aligned
+            with the emitted frames, i.e. dropped first frame).
+        """
+        from inference_video_scripts.streaming_pipeline import (
+            StreamingPipelineConfig,
+            run_streaming_inference,
+        )
+        from diffusion.model.ltx2 import CausalVaeStreamingDecoder
+        from diffusion.refiner.diffusers_ltx2_refiner import (
+            RefinerChunkRunner,
+            STAGE_2_DISTILLED_SIGMA_VALUES,
+        )
+
+        if "LTX2VAE_diffusers_causal" not in self.config.vae.vae_type:
+            raise ValueError(
+                "generate_streaming requires --use_causal_vae (config.vae.vae_type "
+                f"must include 'LTX2VAE_diffusers_causal'); got {self.config.vae.vae_type!r}."
+            )
+        if self.refiner_settings is None or self.refiner_settings.block_size is None:
+            raise ValueError(
+                "generate_streaming requires --refiner_block_size to be set "
+                "(canonical: 3). Pass --refiner_block_size 3."
+            )
+        if params.sampling_algo != "self_forcing":
+            raise ValueError(
+                "generate_streaming requires --sampling_algo=self_forcing; "
+                f"got {params.sampling_algo!r}."
+            )
+        if self.offload_refiner:
+            # Streaming keeps all three models resident so they can overlap; the
+            # offload path would force CPU-GPU swaps each chunk and defeat the
+            # pipeline. Build the refiner now if it wasn't built eagerly.
+            if not self._refiner_built:
+                self._build_refiner()
+
+        vae_stride = self.config.vae.vae_stride
+        latent_T = (params.num_frames - 1) // vae_stride[0] + 1
+        latent_h = TARGET_HEIGHT // vae_stride[-1]
+        latent_w = TARGET_WIDTH // vae_stride[-1]
+
+        camera = prepare_camera(
+            c2w[: params.num_frames],
+            intrinsics_vec4[: params.num_frames],
+            target_size=(TARGET_HEIGHT, TARGET_WIDTH),
+            vae_stride=vae_stride,
+        )
+
+        # First-frame encode (uses self.vae, which under --use_causal_vae is
+        # the causal VAE — same encoder as the bidirectional sibling).
+        if self.offload_vae:
+            self.vae.to(self.device)
+        img = (T.ToTensor()(image) * 2.0 - 1.0).unsqueeze(0).unsqueeze(2)
+        first_latent = vae_encode(
+            self.config.vae.vae_type,
+            self.vae,
+            img.to(self.device, dtype=self.vae_dtype),
+            device=self.device,
+        ).to(self.weight_dtype)
+        if self.offload_vae:
+            self.vae.to("cpu")
+            torch.cuda.empty_cache()
+
+        cond, cond_mask, neg, neg_mask = self._encode_prompts(prompt, params.negative_prompt)
+        raymap = camera["raymap"].unsqueeze(0).to(self.device, dtype=self.weight_dtype)
+        chunk_plucker = camera["chunk_plucker"].unsqueeze(0).to(self.device, dtype=self.weight_dtype)
+        if params.cfg_scale > 1.0:
+            mask_cfg = torch.cat([neg_mask, cond_mask], dim=0)
+            raymap_cfg = torch.cat([raymap, raymap], dim=0)
+            chunk_plucker_cfg = torch.cat([chunk_plucker, chunk_plucker], dim=0)
+        else:
+            mask_cfg, raymap_cfg, chunk_plucker_cfg = cond_mask, raymap, chunk_plucker
+
+        latent_channels = first_latent.shape[1]
+        generator = torch.Generator(device=self.device).manual_seed(params.seed)
+        z = torch.randn(
+            1,
+            latent_channels,
+            latent_T,
+            latent_h,
+            latent_w,
+            dtype=self.weight_dtype,
+            device=self.device,
+            generator=generator,
+        )
+        z[:, :, :1] = first_latent
+
+        chunk_index = get_chunk_index_from_config(self.config, num_frames=latent_T)
+        model_kwargs: dict[str, object] = dict(
+            data_info={
+                "img_hw": torch.tensor([[TARGET_HEIGHT, TARGET_WIDTH]], dtype=torch.float, device=self.device),
+                "condition_frame_info": {0: 0.0},
+            },
+            mask=mask_cfg,
+            camera_conditions=raymap_cfg,
+            chunk_plucker=chunk_plucker_cfg,
+        )
+        if chunk_index is not None:
+            model_kwargs["chunk_index"] = chunk_index
+
+        flow_shift = self._resolve_flow_shift(params.flow_shift)
+
+        solver = SelfForcingFlowEulerCamCtrl(
+            self.model,
+            condition=cond,
+            uncondition=neg,
+            cfg_scale=params.cfg_scale,
+            flow_shift=flow_shift,
+            model_kwargs=model_kwargs,
+            base_chunk_frames=params.num_frame_per_block,
+            num_cached_blocks=params.num_cached_blocks,
+            sink_token=params.sink_token,
+            use_softmax_attention=True,
+        )
+        # Stage-1's create_autoregressive_segments returns `latent_T // bc`
+        # chunks (chunk 0 absorbs the temporal-stride remainder), so the chunk
+        # count is integer-divided here -- NOT ceil-divided.
+        n_stage1_chunks = latent_T // params.num_frame_per_block
+        stage1_iter = solver.sample_chunks(
+            z,
+            steps=params.step,
+            generator=generator,
+            denoising_step_list=params.denoising_step_list,
+        )
+
+        # Encode refiner prompt with Gemma. The refiner caches the Gemma weights
+        # internally, so it's cheap; transformer is briefly offloaded to CPU to
+        # leave headroom for Gemma's forward, matching the legacy refine path.
+        self.refiner.transformer.to("cpu")
+        torch.cuda.empty_cache()
+        refiner_prompt_embeds, refiner_prompt_attention_mask = self.refiner._encode_prompt(prompt)
+        self.refiner.transformer.to(self.device)
+
+        sigmas_t = torch.tensor(STAGE_2_DISTILLED_SIGMA_VALUES, dtype=torch.float32, device=self.device)
+        refiner_runner = RefinerChunkRunner(
+            self.refiner,
+            prompt_embeds=refiner_prompt_embeds,
+            prompt_attention_mask=refiner_prompt_attention_mask,
+            fps=float(params.fps),
+            sigmas=sigmas_t,
+            source_sink_frames=int(self.refiner_settings.sink_size),
+            block_size=int(self.refiner_settings.block_size),
+            kv_max_frames=int(self.refiner_settings.kv_max_frames),
+            seed=int(self.refiner_settings.seed),
+            spatial_shape=(int(z.shape[3]), int(z.shape[4])),
+        )
+
+        # Causal VAE streaming decoder.
+        vae_streaming_decoder = CausalVaeStreamingDecoder(self.vae)
+
+        cfg = StreamingPipelineConfig(
+            sink_size=int(self.refiner_settings.sink_size),
+            block_size=int(self.refiner_settings.block_size),
+            fps=int(params.fps),
+            output_path=output_path,
+            mp4_crf=int(streaming_crf),
+            mp4_preset=str(streaming_preset),
+            drop_first_pixel=True,
+        )
+        result = run_streaming_inference(
+            stage1_chunk_iter=stage1_iter,
+            n_stage1_chunks=n_stage1_chunks,
+            z_init=z,
+            refiner_runner=refiner_runner,
+            vae_streaming_decoder=vae_streaming_decoder,
+            pixel_h=TARGET_HEIGHT,
+            pixel_w=TARGET_WIDTH,
+            config=cfg,
+            logger=self.logger,
+        )
+
+        return {
+            "output_path": result.output_path,
+            "n_pixel_frames": result.n_pixel_frames,
+            "c2w": c2w[1 : 1 + result.n_pixel_frames],
+        }
 
 
 # ============================================================================
@@ -1001,6 +1256,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "timesteps that must end with 0 (e.g., '1000,750,500,250,0'). When "
         "provided, --step is ignored and these exact timesteps are used.",
     )
+    p.add_argument(
+        "--save_stage1",
+        action="store_true",
+        help="Also Sana-VAE-decode the unrefined stage-1 latent and write it as "
+        "a separate '<name>_stage1.mp4'. No-op when --no_refiner is set.",
+    )
     p.add_argument("--negative_prompt", default="")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument(
@@ -1033,6 +1294,59 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--refiner_seed", type=int, default=42)
     p.add_argument("--sink_size", type=int, default=1)
+    p.add_argument(
+        "--refiner_block_size",
+        type=int,
+        default=None,
+        help="LTX-2 refiner: latent frames per AR block. When set (canonical: 3) "
+        "the refiner runs chunk-causal AR with a sliding KV window; when unset "
+        "it falls back to the legacy single-shot sink-bidirectional Euler path.",
+    )
+    p.add_argument(
+        "--refiner_kv_max_frames",
+        type=int,
+        default=11,
+        help="LTX-2 refiner: maximum (sink + history + active) latent frames "
+        "retained in the AR sliding window. Canonical: 11 = 1 sink + 10 recent.",
+    )
+
+    # Causal VAE + interactive chunk-pipelined streaming.
+    p.add_argument(
+        "--use_causal_vae",
+        action="store_true",
+        help="Replace the bidirectional LTX-2 VAE with the causal LTX-2 VAE "
+        "(AutoencoderKLCausalLTX2Video). The encoder is identical to the "
+        "bidirectional sibling, so first-frame encoding is unaffected; the "
+        "decoder gains a per-layer feature cache that supports chunk-by-chunk "
+        "streaming decode.",
+    )
+    p.add_argument(
+        "--causal_vae_path",
+        default=None,
+        help="Path to a causal LTX-2 VAE checkpoint directory (config.json + "
+        "diffusion_pytorch_model.safetensors). Required when --use_causal_vae "
+        "is set.",
+    )
+    p.add_argument(
+        "--interactive_streaming",
+        action="store_true",
+        help="Run the chunk-pipelined interactive inference path: stage-1, "
+        "refiner, and causal-VAE decode each operate on one 3-latent-frame "
+        "block at a time, overlapped on three CUDA streams. Writes a growing "
+        "MP4 to <output_dir>/<name>_streaming.mp4. Requires --use_causal_vae "
+        "and a refiner with --refiner_block_size set.",
+    )
+    p.add_argument(
+        "--streaming_crf",
+        type=int,
+        default=18,
+        help="ffmpeg CRF for the progressive MP4 writer (lower = higher quality).",
+    )
+    p.add_argument(
+        "--streaming_preset",
+        default="medium",
+        help="ffmpeg libx264 preset for the progressive MP4 writer.",
+    )
 
     # Memory.
     p.add_argument("--offload_vae", action="store_true", help="Move the VAE to CPU between encode/decode steps.")
@@ -1112,6 +1426,23 @@ def main() -> None:
         config_class=InferenceConfig, config_path=resolve_hf_path(args.config), args=[]
     )
 
+    # Causal VAE swap: change vae_type + checkpoint path before pipeline build.
+    if args.use_causal_vae:
+        if not args.causal_vae_path:
+            raise SystemExit("--use_causal_vae requires --causal_vae_path.")
+        config.vae.vae_type = "LTX2VAE_diffusers_causal"
+        config.vae.vae_pretrained = args.causal_vae_path
+        logger.info(
+            f"[causal-vae] vae_type set to {config.vae.vae_type!r}; "
+            f"vae_pretrained -> {config.vae.vae_pretrained}"
+        )
+    if args.interactive_streaming and not args.use_causal_vae:
+        raise SystemExit("--interactive_streaming requires --use_causal_vae.")
+    if args.interactive_streaming and args.refiner_block_size is None:
+        raise SystemExit("--interactive_streaming requires --refiner_block_size (canonical: 3).")
+    if args.interactive_streaming and args.sampling_algo != "self_forcing":
+        raise SystemExit("--interactive_streaming requires --sampling_algo=self_forcing.")
+
     refiner = (
         None
         if args.no_refiner
@@ -1120,6 +1451,8 @@ def main() -> None:
             gemma_root=args.refiner_gemma_root,
             sink_size=args.sink_size,
             seed=args.refiner_seed,
+            block_size=args.refiner_block_size,
+            kv_max_frames=args.refiner_kv_max_frames,
         )
     )
 
@@ -1152,7 +1485,28 @@ def main() -> None:
         sink_token=args.sink_token,
         num_frame_per_block=args.num_frame_per_block,
         denoising_step_list=denoising_step_list,
+        save_stage1=args.save_stage1,
     )
+
+    if args.interactive_streaming:
+        out_dir = Path(args.output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        streaming_path = out_dir / f"{args.name}_streaming.mp4"
+        logger.info(f"[streaming] starting interactive chunk-pipelined inference -> {streaming_path}")
+        result = pipeline.generate_streaming(
+            cropped,
+            prompt,
+            c2w,
+            intrinsics_vec4,
+            params,
+            output_path=streaming_path,
+            streaming_crf=args.streaming_crf,
+            streaming_preset=args.streaming_preset,
+        )
+        logger.info(
+            f"[streaming] done: wrote {result['n_pixel_frames']} frames to {result['output_path']}"
+        )
+        return
 
     out = pipeline.generate(cropped, prompt, c2w, intrinsics_vec4, params)
     video_hwc = out["video"]
@@ -1162,6 +1516,13 @@ def main() -> None:
         video_hwc = apply_overlay(video_hwc, out["c2w"])
 
     write_video(args.output_dir, args.name, video_hwc, params.fps, logger)
+
+    stage1_video = out.get("stage1_video")
+    if stage1_video is not None:
+        stage1_hwc = stage1_video
+        if not args.no_action_overlay:
+            stage1_hwc = apply_overlay(stage1_hwc, out["stage1_c2w"])
+        write_video(args.output_dir, f"{args.name}_stage1", stage1_hwc, params.fps, logger)
 
 
 if __name__ == "__main__":

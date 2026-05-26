@@ -584,6 +584,40 @@ class SelfForcingFlowEulerCamCtrl(SelfForcingFlowEuler):
         Returns:
             Denoised latent tensor with the same shape as ``latents``.
         """
+        for _ in self.sample_chunks(
+            latents,
+            steps=steps,
+            generator=generator,
+            denoising_step_list=denoising_step_list,
+            **kwargs,
+        ):
+            pass
+        return latents
+
+    @torch.no_grad()
+    def sample_chunks(
+        self,
+        latents: torch.Tensor,
+        steps: int = 50,
+        generator: torch.Generator | None = None,
+        *,
+        denoising_step_list: list[int] | None = None,
+        **kwargs: object,
+    ):
+        """Streaming variant of :meth:`sample` — yields one chunk at a time.
+
+        After each AR chunk completes (denoising + KV-cache save pass), yields
+        a tuple ``(chunk_idx, latent_chunk_view, start_f, end_f)`` where
+        ``latent_chunk_view`` is a *view* into the in-place-mutated ``latents``
+        tensor for the just-finished chunk. The view stays valid for the
+        remainder of inference (subsequent chunks never overwrite earlier
+        frames), so the orchestrator may launch downstream work on a separate
+        CUDA stream and continue pulling chunks without copying.
+
+        ``sample(latents, ...)`` is implemented as ``for _ in sample_chunks(...)``
+        and returns ``latents`` after exhaustion, so the legacy whole-volume
+        API is preserved.
+        """
         # Resolve scheduler factory once (a fresh instance is built per chunk).
         if denoising_step_list is not None:
             if len(denoising_step_list) < 2 or denoising_step_list[-1] != 0:
@@ -809,7 +843,7 @@ class SelfForcingFlowEulerCamCtrl(SelfForcingFlowEuler):
             )
             kv_cache[chunk_idx] = updated_kv_cache
 
-        return latents
+            yield chunk_idx, latents[:, :, start_f:end_f], start_f, end_f
 
     # ------------------------------------------------------------------
     # KV cache management
