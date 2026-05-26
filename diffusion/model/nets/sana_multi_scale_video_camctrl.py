@@ -48,6 +48,10 @@ from diffusion.model.wan.model import BlockHook
 from diffusion.utils.dist_utils import get_rank
 from diffusion.utils.import_utils import is_xformers_available
 
+from .cached_chunk_causal_blocks import (
+    CachedChunkCausalGDNUCPESinglePathLiteLA,
+    CachedSoftmaxUCPESinglePathLiteLA,
+)
 from .sana_camctrl_blocks import (
     _maybe_drop_cam_branch,
     _process_camera_conditions_ucpe,
@@ -58,6 +62,8 @@ from .sana_gdn_blocks_triton import (
 )
 from .sana_gdn_camctrl_blocks import (
     BidirectionalSoftmaxUCPESinglePathLiteLA,
+    ChunkCausalGDNUCPESinglePathLiteLA,
+    ChunkCausalSoftmaxUCPESinglePathLiteLA,
 )
 
 # xformers is OFF by default on this stack (see diffusion/model/nets/sana_blocks.py for rationale).
@@ -169,6 +175,71 @@ class SanaVideoMSCamCtrlBlock(nn.Module):
         elif camctrl_type == "BidirectionalSoftmaxUCPESinglePathLiteLA":
             self_num_heads = hidden_size // linear_head_dim
             self.attn = BidirectionalSoftmaxUCPESinglePathLiteLA(
+                hidden_size,
+                hidden_size,
+                heads=self_num_heads,
+                cam_dim=hidden_size // cam_attn_compress,
+                cam_heads=max(1, self_num_heads // cam_attn_compress),
+                eps=1e-8,
+                qk_norm=qk_norm,
+                patch_size=patch_size,
+                **block_kwargs,
+            )
+        elif camctrl_type == "ChunkCausalGDNUCPESinglePathLiteLA":
+            # Chunk-causal variant of the GDN+UCPE single-path camctrl block.
+            # Same module shapes / state-dict keys as the bidirectional
+            # variant; the main branch routes through ``ChunkCausalGDN``
+            # forward semantics and the camera branch reuses single-path.
+            self_num_heads = hidden_size // linear_head_dim
+            self.attn = ChunkCausalGDNUCPESinglePathLiteLA(
+                hidden_size,
+                hidden_size,
+                heads=self_num_heads,
+                cam_dim=hidden_size // cam_attn_compress,
+                cam_heads=max(1, self_num_heads // cam_attn_compress),
+                eps=1e-8,
+                qk_norm=qk_norm,
+                patch_size=patch_size,
+                **block_kwargs,
+            )
+        elif camctrl_type == "CachedChunkCausalGDNUCPESinglePathLiteLA":
+            # Cached counterpart of the chunk-causal GDN+UCPE block: same
+            # init signature, but exposes a ``forward(..., kv_cache=...,
+            # save_kv_cache=...)`` path for self-forcing inference.
+            self_num_heads = hidden_size // linear_head_dim
+            self.attn = CachedChunkCausalGDNUCPESinglePathLiteLA(
+                hidden_size,
+                hidden_size,
+                heads=self_num_heads,
+                cam_dim=hidden_size // cam_attn_compress,
+                cam_heads=max(1, self_num_heads // cam_attn_compress),
+                eps=1e-8,
+                qk_norm=qk_norm,
+                patch_size=patch_size,
+                **block_kwargs,
+            )
+        elif camctrl_type == "ChunkCausalSoftmaxUCPESinglePathLiteLA":
+            # Softmax counterpart of the chunk-causal GDN block (alias of
+            # ``_SoftmaxUCPESinglePathLiteLA``).  Used in hybrid stacks where
+            # every ``softmax_every_n``-th block swaps the main branch.
+            self_num_heads = hidden_size // linear_head_dim
+            self.attn = ChunkCausalSoftmaxUCPESinglePathLiteLA(
+                hidden_size,
+                hidden_size,
+                heads=self_num_heads,
+                cam_dim=hidden_size // cam_attn_compress,
+                cam_heads=max(1, self_num_heads // cam_attn_compress),
+                eps=1e-8,
+                qk_norm=qk_norm,
+                patch_size=patch_size,
+                **block_kwargs,
+            )
+        elif camctrl_type == "CachedSoftmaxUCPESinglePathLiteLA":
+            # Cached softmax + UCPE camera block.  Caches post-RoPE K/V on
+            # the main branch and post-UCPE-transform K/V on the camera
+            # branch, concatenating across chunks during inference.
+            self_num_heads = hidden_size // linear_head_dim
+            self.attn = CachedSoftmaxUCPESinglePathLiteLA(
                 hidden_size,
                 hidden_size,
                 heads=self_num_heads,
@@ -552,6 +623,8 @@ class SanaVideoMSCamCtrlBlock(nn.Module):
 
 _GDN_TO_SOFTMAX_CAMCTRL: dict[str, str] = {
     "BidirectionalGDNUCPESinglePathLiteLABothTriton": "BidirectionalSoftmaxUCPESinglePathLiteLA",
+    "ChunkCausalGDNUCPESinglePathLiteLA": "ChunkCausalSoftmaxUCPESinglePathLiteLA",
+    "CachedChunkCausalGDNUCPESinglePathLiteLA": "CachedSoftmaxUCPESinglePathLiteLA",
 }
 
 
@@ -686,6 +759,10 @@ class SanaMSVideoCamCtrl(Sana):
         assert self.camctrl_type in [
             "BidirectionalGDNUCPESinglePathLiteLABothTriton",
             "BidirectionalSoftmaxUCPESinglePathLiteLA",
+            "ChunkCausalGDNUCPESinglePathLiteLA",
+            "CachedChunkCausalGDNUCPESinglePathLiteLA",
+            "CachedSoftmaxUCPESinglePathLiteLA",
+            "ChunkCausalSoftmaxUCPESinglePathLiteLA",
         ], f"Not supported camera control type: {self.camctrl_type}"
 
         self.camctrl_layers_num = camctrl_layers_num if camctrl_layers_num is not None else depth
@@ -1198,7 +1275,357 @@ class SanaMSVideoCamCtrl(Sana):
             "SoftmaxUCPELiteLA",
         )
 
+    def forward_long(self, x, timestep, y, mask=None, **kwargs):
+        """Forward pass for self-forcing / chunk-causal AR KV-cache inference.
+
+        Mirrors :meth:`forward` exactly with two streaming-specific differences:
+
+        1. Rotary positional embeddings (``casual_wan_rope``) are built over the
+           explicit window ``[start_f, end_f)`` (or an explicit ``frame_index``
+           tensor for sink + window layouts) rather than the full sequence.
+        2. Each block receives its per-block ``kv_cache`` slot (``kv_cache[i]``)
+           and may write back updated state when ``save_kv_cache=True``.  The
+           per-block returns are collected and the updated ``kv_cache`` list is
+           returned alongside the output tensor.
+
+        All camera-conditioning behaviour (UCPE absmap, Plucker embeddings,
+        ``raymats``, ``camera_conditions``) is identical to :meth:`forward`.
+
+        Args:
+            x: ``(N, C, T, H, W)`` latent inputs for the current chunk.
+            timestep: ``(N,)`` or ``(N, 1, F)`` diffusion timesteps.
+            y: ``(N, 1, L, C)`` text caption embeddings.
+            mask: Optional ``(N, L)`` text mask.
+            **kwargs: Same as :meth:`forward`, plus the following streaming-only
+                keys (all popped before delegating to blocks):
+
+                * ``start_f`` / ``end_f``: latent frame range for this call,
+                  in *unpatched* latent-frame units.  Converted to patch-frame
+                  units via ``patch_size[0]``.
+                * ``frame_index``: optional ``(F,)`` long tensor of explicit
+                  per-latent-frame indices (e.g. sink + sliding window).
+                  Takes precedence over ``(start_f, end_f)`` for RoPE.
+                * ``kv_cache``: ``list[Any]`` of length ``len(self.blocks)``.
+                  Required: each entry holds the cached state for one block.
+                * ``save_kv_cache``: ``bool``.  When ``True``, blocks update
+                  their cache slots in-place via the returned values.
+
+        Returns:
+            ``(x, kv_cache)``: the denoised latent tensor (same shape contract
+            as :meth:`forward`) and the (possibly updated) ``kv_cache`` list.
+        """
+        # --- Extract cached-inference parameters ---
+        start_f = kwargs.pop("start_f", None)
+        end_f = kwargs.pop("end_f", None)
+        frame_index = kwargs.pop("frame_index", None)
+        kv_cache = kwargs.pop("kv_cache", None)
+        save_kv_cache = kwargs.pop("save_kv_cache", False)
+        if start_f is not None and end_f is not None:
+            assert self.pos_embed_type == "casual_wan_rope", (
+                "forward_long requires pos_embed_type='casual_wan_rope' when "
+                f"start_f/end_f are provided; got '{self.pos_embed_type}'"
+            )
+            start_f = start_f // self.patch_size[0]
+            end_f = end_f // self.patch_size[0]
+        if frame_index is not None:
+            # Sampler builds frame_index in latent-frame units. Convert to
+            # patch-frame units the same way start_f / end_f are converted,
+            # while preserving length == patch-frames (one entry per patch
+            # frame, not per latent frame).  Assumes the sink / window ranges
+            # are patch-aligned.
+            ps_t = self.patch_size[0]
+            if ps_t > 1:
+                frame_index = frame_index[::ps_t] // ps_t
+
+        bs = x.shape[0]
+        x = x.to(self.dtype)
+        if self.timestep_norm_scale_factor != 1.0:
+            timestep = (timestep.float() / self.timestep_norm_scale_factor).to(torch.float32)
+        else:
+            timestep = timestep.long().to(torch.float32)
+        y = y.to(self.dtype)
+        self.f, self.h, self.w = (
+            x.shape[-3] // self.patch_size[0],
+            x.shape[-2] // self.patch_size[1],
+            x.shape[-1] // self.patch_size[2],
+        )
+
+        data_info = kwargs.get("data_info", {})
+        if data_info.get("image_vae_embeds", None) is not None:
+            x = torch.cat([x, data_info["image_vae_embeds"].to(self.dtype)], dim=1)
+        if data_info.get("image_embeds", None) is not None:
+            image_embeds = data_info["image_embeds"].to(self.dtype)
+            image_embeds = self.image_embedder(image_embeds)
+            kwargs["image_embeds"] = image_embeds
+
+        if self.save_qkv:
+            self.qkv_store_buffer[int(timestep[0].item())] = {}
+        if self.save_block_output:
+            self.inference_timestep = int(timestep[0].item())
+
+        cam_embeds = kwargs.get("camera_conditions", None)
+        cam_branch_drop_prob = kwargs.get("cam_branch_drop_prob", 0.0)
+        if cam_embeds is not None and cam_branch_drop_prob:
+            # Keep drop-path semantics consistent: when camera branch is
+            # dropped, skip both camera-attention branch and camera embedding
+            # injection.  (Drop is a no-op at inference; included for parity.)
+            cam_embeds = _maybe_drop_cam_branch(
+                cam_embeds,
+                cam_branch_drop_prob,
+                self.training,
+                x.device,
+            )
+            if cam_embeds is None:
+                kwargs["camera_conditions"] = None
+        if self.pack_latents:
+            x = self._pack_latents(x, bs, self.in_channels, self.h, self.w, self.f)
+            if cam_embeds is not None:
+                cam_embeds = cam_embeds.to(self.dtype)
+
+            self.h = self.h // 2
+            self.w = self.w // 2
+
+        if self.x_embedder.patch_size != self.x_embedder.kernel_size and self.x_embedder.kernel_size == (1, 2, 2):
+            x = F.pad(x, (0, 1, 0, 1, 0, 0))
+            if cam_embeds is not None:
+                cam_embeds = F.pad(cam_embeds, (0, 1, 0, 1, 0, 0))
+
+        x = self.x_embedder(x)
+        if cam_embeds is not None:
+            # All surviving camctrl variants are UCPE-style: build raymats +
+            # 3-channel absmap (up_map + lat_map) from the raw (B, F, 20)
+            # camera conditions.
+            raw_cam_conditions = cam_embeds
+            cam_pos_embeds = kwargs.get("cam_pos_embeds", None)
+            if cam_pos_embeds is not None and "absmap" in cam_pos_embeds:
+                cam_embeds = cam_pos_embeds["absmap"]
+                if "P" in cam_pos_embeds:
+                    kwargs["raymats"] = cam_pos_embeds["P"]
+            else:
+                raymats, cam_embeds = _process_camera_conditions_ucpe(
+                    raw_cam_conditions, bs, (self.f, self.h, self.w), self.patch_size
+                )
+                cam_embeds = cam_embeds.permute(0, 4, 1, 2, 3).to(self.dtype)
+                kwargs["raymats"] = raymats
+            _skip_absmap = getattr(self, "use_chunk_plucker_input", False) or getattr(
+                self, "use_chunk_plucker_post_attn", False
+            )
+            if not _skip_absmap:
+                cam_embeds = self.raymap_embedder(cam_embeds)
+                x = x + cam_embeds
+                kwargs["camera_embedding"] = cam_embeds
+                kwargs["camera_conditions"] = raw_cam_conditions
+
+        if getattr(self, "use_chunk_plucker_input", False) and "chunk_plucker" in kwargs:
+            plucker_input = kwargs["chunk_plucker"].to(self.dtype)
+            plucker_emb = self.plucker_embedder(plucker_input)
+            x = x + plucker_emb
+
+        if getattr(self, "use_chunk_plucker_post_attn", False) and "chunk_plucker" in kwargs:
+            plucker_input = kwargs["chunk_plucker"].to(self.dtype)
+            kwargs["plucker_emb"] = self.plucker_embedder(plucker_input)
+
+        image_pos_embed = kwargs.get("pos_embeds", None)
+        if self.use_pe and image_pos_embed is None:
+            if self.pos_embed_type == "sincos":
+                if self.pos_embed_ms is None or self.pos_embed_ms.shape[1:] != x.shape[1:]:
+                    self.pos_embed_ms = (
+                        torch.from_numpy(
+                            get_2d_sincos_pos_embed(
+                                self.pos_embed.shape[-1],
+                                (self.h, self.w),
+                                pe_interpolation=self.pe_interpolation,
+                                base_size=self.base_size,
+                            )
+                        )
+                        .unsqueeze(0)
+                        .to(x.device)
+                        .to(self.dtype)
+                    )
+                x += self.pos_embed_ms  # (N, T, D), where T = H * W / patch_size ** 2
+            elif self.pos_embed_type == "flux_rope":
+                self.pos_embed_ms = RopePosEmbed(theta=10000, axes_dim=[12, 10, 10])
+                latent_image_ids = self.pos_embed_ms._prepare_latent_image_ids(
+                    bs, self.h, self.w, x.device, x.dtype, frame=self.f
+                )
+                image_pos_embed = self.pos_embed_ms(latent_image_ids)
+            elif self.pos_embed_type == "wan_rope":
+                image_pos_embed = self._compute_rope_with_cp(x.device, self.h, self.w)
+            elif self.pos_embed_type == "casual_wan_rope":
+                if frame_index is not None:
+                    # Discontinuous positions (e.g. sink + sliding window):
+                    # rope is built from explicit per-frame indices instead of
+                    # a contiguous range.
+                    image_pos_embed = self.rope(
+                        ((0, int(frame_index.numel())), self.h, self.w),
+                        x.device,
+                        frame_index=frame_index,
+                    )
+                elif start_f is not None and end_f is not None:
+                    image_pos_embed = self.rope(((start_f, end_f), self.h, self.w), x.device)
+                else:
+                    image_pos_embed = self.rope(((0, self.f), self.h, self.w), x.device)
+            elif self.pos_embed_type == "wan_temporal_rope":
+                image_pos_embed = self._compute_rope_with_cp(x.device, self.h, self.w)
+            else:
+                raise ValueError(f"Unknown pos_embed_type: {self.pos_embed_type}")
+        elif image_pos_embed is not None:
+            image_pos_embed = image_pos_embed.to(x.device)
+            while image_pos_embed.ndim > 4:
+                image_pos_embed = image_pos_embed.squeeze(1)
+
+        t = self.t_embedder(timestep.flatten())  # (N, D)
+        t0 = self.t_block(t)
+        t = t.unflatten(dim=0, sizes=timestep.shape)
+        t0 = t0.unflatten(dim=0, sizes=timestep.shape)
+
+        # Compute delta embeddings for final_layer (stored separately, not
+        # touching t / t0).
+        _delta_t_emb = None
+        if getattr(self, "use_delta_actions", False) and "delta_actions" in kwargs:
+            da = kwargs["delta_actions"].to(self.dtype)
+            _delta_t_emb = self.delta_action_embedder(da)  # (B, T, D)
+
+        if getattr(self, "use_delta_translation", False) and kwargs.get("camera_conditions") is not None:
+            cam_cond = kwargs["camera_conditions"].to(self.dtype)
+            c2w = cam_cond[:, :, :16].view(cam_cond.shape[0], cam_cond.shape[1], 4, 4)
+            t_cam = c2w[:, :, :3, 3]  # (B, T, 3)
+            delta_t = t_cam[:, 1:, :] - t_cam[:, :-1, :]
+            delta_t = torch.cat([torch.zeros_like(delta_t[:, :1, :]), delta_t], dim=1)
+            dt_emb = self.delta_translation_embedder(delta_t)  # (B, T, D)
+            _delta_t_emb = dt_emb if _delta_t_emb is None else _delta_t_emb + dt_emb
+
+        if getattr(self, "use_delta_pose_additive", False) and "delta_actions" in kwargs:
+            da = kwargs["delta_actions"].to(self.dtype)
+            kwargs["delta_pose_emb"] = self.delta_pose_embedder(da)  # (B, T, D)
+
+        y = self.y_embedder(y, self.training, mask=mask)  # (N, D)
+        if self.y_norm:
+            y = self.attention_y_norm(y)
+
+        if mask is not None:
+            mask = mask.to(torch.int16)
+            mask = mask.repeat(y.shape[0] // mask.shape[0], 1) if mask.shape[0] != y.shape[0] else mask
+            mask = mask.squeeze(1).squeeze(1)
+            if _xformers_available:
+                y = y.squeeze(1).masked_select(mask.unsqueeze(-1) != 0).view(1, -1, x.shape[-1])
+                y_lens = mask.sum(dim=1).tolist()
+            else:
+                y_lens = mask
+        elif _xformers_available:
+            y_lens = [y.shape[2]] * y.shape[0]
+            y = y.squeeze(1).view(1, -1, x.shape[-1])
+        else:
+            raise ValueError(f"Attention type is not available due to _xformers_available={_xformers_available}.")
+
+        if self.diagonal_mask is not None:
+            seq_len = x.shape[1]
+            self.diagonal_mask = self.diagonal_mask.to(x.device)
+
+            def mask_mod(b, h, q_idx, kv_idx):
+                return self.diagonal_mask[q_idx, kv_idx].bool()
+
+            block_mask = create_block_mask_cached(
+                mask_mod, None, None, seq_len, seq_len, device=x.device, _compile=False
+            )
+        else:
+            block_mask = None
+
+        if kwargs.get("camera_conditions") is not None:
+            # Pre-compute UCPE projection functions to share across blocks
+            # (all surviving camctrl variants are UCPE-style).
+            if self.attn_type in ["flash", "FlexLinearAttention", "flex"]:
+                head_dim = self.hidden_size // self.num_heads
+            else:
+                head_dim = self.linear_head_dim
+
+            cam_pos_embeds = kwargs.get("cam_pos_embeds", None)
+            if cam_pos_embeds is not None:
+                for k, v in cam_pos_embeds.items():
+                    if isinstance(v, torch.Tensor):
+                        v = v.to(x.device)
+                        if k == "absmap":
+                            while v.ndim > 5:
+                                v = v.squeeze(1)
+                        else:
+                            while v.ndim > 4:
+                                v = v.squeeze(1)
+                        cam_pos_embeds[k] = v
+
+            kwargs["prope_fns"] = prepare_prope_fns(
+                camctrl_type="UCPE",
+                head_dim=head_dim,
+                camera_conditions=kwargs["camera_conditions"],
+                HW=(self.f, self.h, self.w),
+                patch_size=self.patch_size,
+                rotary_emb=image_pos_embed,
+                raymats=kwargs.get("raymats"),
+                cam_pos_embeds=cam_pos_embeds,
+            )
+
+        assert kv_cache is not None and len(kv_cache) == len(
+            self.blocks
+        ), "kv_cache must be a list of the same length as the number of blocks"
+
+        # Pad cross-attention queries to the total sequence length so that
+        # xformers uses the same tiling as the baseline forward() path.
+        # ``end_f`` is the total latent frame count (already patch-divided).
+        if end_f is not None and self.f > 0:
+            per_frame_tokens = x.shape[1] // self.f
+            total_tokens = end_f * per_frame_tokens
+            if total_tokens > x.shape[1]:
+                kwargs["_cross_attn_pad_to"] = total_tokens
+
+        for i, block in enumerate(self.blocks):
+            if self.save_qkv:
+                block.attn.qkv_store_buffer = {}
+
+            x, kv_cache_i = torch.utils.checkpoint.checkpoint(
+                block,
+                x,
+                y,
+                t0,
+                y_lens,
+                (self.f, self.h, self.w),
+                image_pos_embed,
+                block_mask=block_mask if i > 1 else None,
+                kv_cache=kv_cache[i],
+                save_kv_cache=save_kv_cache,
+                **kwargs,
+                use_reentrant=False,
+            )
+            kv_cache[i] = kv_cache_i
+
+            if self.save_qkv:
+                self.qkv_store_buffer[int(timestep[0].item())][f"block_{i}"] = block.attn.qkv_store_buffer
+                block.attn.qkv_store_buffer = None
+
+        if _delta_t_emb is not None:
+            if t.ndim == 2:
+                t = t.unsqueeze(1).expand(-1, _delta_t_emb.shape[1], -1)
+            elif t.ndim == 4:
+                t = t.squeeze(1)
+            t = t + _delta_t_emb
+            t = t.unsqueeze(1)
+
+        x = self.final_layer(x, t)  # (N, T, patch_size ** 2 * out_channels)
+        x = self.unpatchify(x)  # (N, out_channels, H, W)
+        if self.pack_latents:
+            x = self._unpack_latents(x, self.h * 2, self.w * 2, self.f)
+
+        if self.save_block_output:
+            block_output = self.get_block_output()
+            self.block_output_buffer[self.inference_timestep] = block_output
+        return x, kv_cache
+
     def __call__(self, *args, **kwargs):
+        """Dispatch to :meth:`forward_long` for cached AR inference, else :meth:`forward`.
+
+        ``forward_long`` is selected iff the caller passes a non-``None``
+        ``start_f`` in kwargs (the streaming sampler always provides one).
+        """
+        if kwargs.get("start_f") is not None:
+            return self.forward_long(*args, **kwargs)
         return self.forward(*args, **kwargs)
 
     def forward_with_dpmsolver(self, x, timestep, y, data_info, **kwargs):

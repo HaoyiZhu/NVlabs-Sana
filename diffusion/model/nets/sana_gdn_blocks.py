@@ -1114,6 +1114,573 @@ class BidirectionalGDN(GDN):
         return out
 
 
+@ATTENTION_BLOCKS.register_module()
+class ChunkCausalGDN(GDN):
+    """Chunk-causal GDN attention.
+
+    Within each chunk the recurrence behaves bidirectionally (forward
+    causal scan plus per-chunk backward scan); across chunks it remains
+    strictly causal.  This matches the attention pattern of a frame-wise
+    block-causal mask while retaining the linear-time GDN scan.
+
+    Chunk boundaries are derived from ``chunk_size`` / ``chunk_index`` /
+    ``chunk_split_strategy`` passed via ``forward``.  When ``chunk_size``
+    is ``None`` or larger than ``T`` the block degenerates to the
+    bidirectional GDN scan.
+    """
+
+    @staticmethod
+    def _backward_causal_conv_per_chunk(
+        x: torch.Tensor,
+        conv: ShortConvolution,
+        T: int,
+        chunk_size: int | None,
+        chunk_index: list[int] | None,
+        chunk_split_strategy: str,
+    ) -> torch.Tensor:
+        """Run backward (anti-causal) conv isolated per chunk.
+
+        Within each chunk the input is time-flipped, the causal conv is
+        applied, and the output is flipped back.  Chunks do not share any
+        context, preventing backward information leakage across boundaries.
+
+        Args:
+            x: Tensor of shape ``(B*S, T, C)``.
+            conv: FLA ``ShortConvolution`` module.
+            T: Number of temporal frames.
+            chunk_size: Uniform chunk size (or ``None``).
+            chunk_index: Explicit chunk boundaries (or ``None``).
+            chunk_split_strategy: Strategy for deriving boundaries.
+
+        Returns:
+            Tensor of shape ``(B*S, T, C)`` — per-chunk backward conv.
+        """
+        BS = x.shape[0]
+
+        if chunk_size is not None and T % chunk_size == 0:
+            # Vectorized: reshape chunks into batch, flip, conv, flip back.
+            num_chunks = T // chunk_size
+            xc = x.reshape(BS, num_chunks, chunk_size, -1)
+            xc = xc.reshape(BS * num_chunks, chunk_size, -1)
+            yc, _ = conv(xc.flip(1))
+            yc = yc.flip(1)
+            return yc.reshape(BS, num_chunks, chunk_size, -1).reshape(BS, T, -1)
+
+        # Resolve chunk boundaries for non-uniform patterns.
+        valid_chunk_index, _ = normalize_chunk_index(chunk_index, T, chunk_size, chunk_split_strategy)
+        chunk_sizes = [valid_chunk_index[i + 1] - valid_chunk_index[i] for i in range(len(valid_chunk_index) - 1)]
+
+        # Fast path for first_plus_one pattern: first chunk is (chunk_size+1),
+        # remaining chunks are all chunk_size.  This reduces ~N conv calls to 2-3.
+        if (
+            chunk_size is not None
+            and len(chunk_sizes) >= 2
+            and chunk_sizes[0] == chunk_size + 1
+            and all(cs == chunk_size for cs in chunk_sizes[1:])
+        ):
+            first_chunk_size = chunk_size + 1
+
+            # Process first chunk (size chunk_size+1) with one conv call.
+            first_seg = x[:, :first_chunk_size, :]
+            first_out, _ = conv(first_seg.flip(1))
+            first_out = first_out.flip(1)
+
+            # Vectorize the uniform tail into batched conv calls.
+            # Cap batch size to avoid Triton kernel grid-dimension limits
+            # (BS * num_tail can reach ~17k during inference, exceeding limits).
+            _MAX_CONV_BATCH = 4096
+            tail_x = x[:, first_chunk_size:, :]
+            T_tail = T - first_chunk_size
+            num_tail = T_tail // chunk_size
+            if num_tail > 0:
+                vectorizable_len = num_tail * chunk_size
+                total_batch = BS * num_tail
+                if total_batch <= _MAX_CONV_BATCH:
+                    tail_batch = tail_x[:, :vectorizable_len, :].reshape(total_batch, chunk_size, -1)
+                    tail_out, _ = conv(tail_batch.flip(1))
+                    tail_out = tail_out.flip(1).reshape(BS, vectorizable_len, -1)
+                else:
+                    # Process in sub-batches to stay within kernel limits.
+                    max_chunks_per_call = max(1, _MAX_CONV_BATCH // BS)
+                    tail_parts: list[torch.Tensor] = []
+                    for i in range(0, num_tail, max_chunks_per_call):
+                        n = min(max_chunks_per_call, num_tail - i)
+                        seg_len = n * chunk_size
+                        seg = tail_x[:, i * chunk_size : i * chunk_size + seg_len, :]
+                        seg_batch = seg.reshape(BS * n, chunk_size, -1)
+                        seg_out, _ = conv(seg_batch.flip(1))
+                        tail_parts.append(seg_out.flip(1).reshape(BS, seg_len, -1))
+                    tail_out = torch.cat(tail_parts, dim=1)
+
+                # Handle possible remainder chunk (if T_tail is not divisible by chunk_size).
+                remainder = T_tail - vectorizable_len
+                if remainder > 0:
+                    rem_seg = tail_x[:, vectorizable_len:, :]
+                    rem_out, _ = conv(rem_seg.flip(1))
+                    rem_out = rem_out.flip(1)
+                    return torch.cat([first_out, tail_out, rem_out], dim=1)
+                return torch.cat([first_out, tail_out], dim=1)
+            else:
+                # Only the first chunk exists (edge case: T == chunk_size+1).
+                return first_out
+
+        # Generic fallback: loop over arbitrary chunk boundaries.
+        bounds = list(zip(valid_chunk_index[:-1], valid_chunk_index[1:]))
+        parts: list[torch.Tensor] = []
+        for start_t, end_t in bounds:
+            seg = x[:, start_t:end_t, :]
+            seg_out, _ = conv(seg.flip(1))
+            parts.append(seg_out.flip(1))
+        return torch.cat(parts, dim=1)
+
+    def _batched_backward_scan(
+        self,
+        q_bwd: torch.Tensor,
+        k_bwd: torch.Tensor,
+        v_bwd: torch.Tensor,
+        q_rot_bwd: torch.Tensor,
+        k_rot_bwd: torch.Tensor,
+        beta_bwd: torch.Tensor,
+        decay_bwd: torch.Tensor,
+        recall_gate: torch.Tensor | None,
+        B: int,
+        T: int,
+        S: int,
+        chunk_size: int,
+        chunk_index: list[int] | None,
+        chunk_split_strategy: str,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run backward GDN scan with per-chunk batch parallelism.
+
+        In chunk-causal mode the backward recurrence is independent across
+        chunks (state resets to zero at boundaries).  Instead of running
+        one sequential scan over all ``T`` frames, we batch independent
+        chunks along the ``B`` dimension and run short scans in parallel.
+
+        All inputs are in time-structure: ``(B, H, T, D, S)`` for q/k/v
+        or ``(B, H, T, ...)`` for beta/decay.  Returns ``(num, den)`` in
+        the flat layout ``(B, H, D, N)`` matching ``update_rule_func``
+        output.
+        """
+        H = self.heads
+        D = self.dim
+
+        # Compute reversed chunk boundaries in the backward (flipped) domain.
+        valid_chunk_index, _ = normalize_chunk_index(chunk_index, T, chunk_size, chunk_split_strategy)
+        reversed_boundaries = sorted(T - b for b in valid_chunk_index)
+        num_chunks = len(reversed_boundaries) - 1
+        chunk_sizes_bwd = [reversed_boundaries[i + 1] - reversed_boundaries[i] for i in range(num_chunks)]
+
+        # Group chunks by size for efficient batching.
+        from collections import defaultdict
+
+        size_groups: dict[int, list[int]] = defaultdict(list)
+        for ci, cs in enumerate(chunk_sizes_bwd):
+            size_groups[cs].append(ci)
+
+        # Pre-split time-structured tensors by reversed boundaries.
+        def _split_time(t: torch.Tensor, dim: int = 2) -> list[torch.Tensor]:
+            return [t.narrow(dim, reversed_boundaries[i], chunk_sizes_bwd[i]) for i in range(num_chunks)]
+
+        q_chunks = _split_time(q_bwd)
+        k_chunks = _split_time(k_bwd)
+        v_chunks = _split_time(v_bwd)
+        qr_chunks = _split_time(q_rot_bwd)
+        kr_chunks = _split_time(k_rot_bwd)
+        beta_chunks = _split_time(beta_bwd)
+        decay_chunks = _split_time(decay_bwd)
+
+        # Process each size group as a single batched scan.
+        num_results: list[torch.Tensor | None] = [None] * num_chunks
+        den_results: list[torch.Tensor | None] = [None] * num_chunks
+
+        def _flatten_time(t: torch.Tensor) -> torch.Tensor:
+            """(B', H, T_chunk, D, S) -> (B', H, D, T_chunk*S)."""
+            return t.permute(0, 1, 3, 2, 4).reshape(t.shape[0], H, D, -1)
+
+        for cs, indices in size_groups.items():
+            len(indices)
+            # Stack chunks: (B, H, cs, D, S) -> (B*nc, H, cs, D, S)
+            q_batch = torch.cat([q_chunks[i] for i in indices], dim=0)
+            k_batch = torch.cat([k_chunks[i] for i in indices], dim=0)
+            v_batch = torch.cat([v_chunks[i] for i in indices], dim=0)
+            qr_batch = torch.cat([qr_chunks[i] for i in indices], dim=0)
+            kr_batch = torch.cat([kr_chunks[i] for i in indices], dim=0)
+            beta_batch = torch.cat([beta_chunks[i] for i in indices], dim=0)
+            decay_batch = torch.cat([decay_chunks[i] for i in indices], dim=0)
+
+            # Flatten to (B*nc, H, D, cs*S) for the scan.
+            q_flat = _flatten_time(q_batch)
+            k_flat = _flatten_time(k_batch)
+            v_flat = _flatten_time(v_batch)
+            qr_flat = _flatten_time(qr_batch)
+            kr_flat = _flatten_time(kr_batch)
+
+            # Beta/decay: squeeze to (B*nc, H, cs) if needed.
+            if beta_batch.ndim == 5:
+                beta_flat = beta_batch.squeeze(-1).squeeze(-1)
+            else:
+                beta_flat = beta_batch
+            if decay_batch.ndim == 5:
+                decay_flat = decay_batch.squeeze(-1).squeeze(-1)
+            else:
+                decay_flat = decay_batch
+
+            # Run the scan (B*nc batch, T=cs).
+            num_g, den_g = self.update_rule_func(
+                q_flat,
+                k_flat,
+                v_flat,
+                qr_flat,
+                kr_flat,
+                beta_flat,
+                decay_flat,
+                recall_gate=recall_gate,
+                eps=self.eps,
+                return_components=True,
+            )
+
+            # Un-batch: (B*nc, H, D, cs*S) -> list of (B, H, D, cs*S).
+            num_parts = num_g.split(B, dim=0)
+            den_parts = den_g.split(B, dim=0)
+            for j, ci in enumerate(indices):
+                num_results[ci] = num_parts[j]
+                den_results[ci] = den_parts[j]
+
+        # Reassemble in original time order: cat along N dimension.
+        num_bwd = torch.cat(num_results, dim=3)  # type: ignore[arg-type]
+        den_bwd = torch.cat(den_results, dim=3)  # type: ignore[arg-type]
+        return num_bwd, den_bwd
+
+    def _apply_temporal_short_conv(
+        self,
+        x: torch.Tensor,
+        conv: ShortConvolution,
+        HW: tuple[int, int, int],
+        **kwargs: object,
+    ) -> torch.Tensor:
+        """Chunk-causal ShortConvolution: global forward + per-chunk backward.
+
+        Mirrors the ChunkCausalGDN recurrence semantics:
+
+        * **Forward (causal)** — runs over the full sequence so that later
+          chunks receive temporal context from earlier chunks.
+        * **Backward (anti-causal)** — runs independently inside each chunk
+          so that no future information leaks across chunk boundaries.
+        * **Center-tap correction** — the current timestep ``x[t]`` appears
+          in both passes; one copy is subtracted so every position in the
+          resulting symmetric window is counted exactly once.
+
+        Args:
+            x: Input tensor of shape ``(B, N, C)`` where ``N = T * S``.
+            conv: FLA ``ShortConvolution`` module.
+            HW: Tuple of ``(T, H, W)`` describing the token layout.
+            **kwargs: Must contain ``chunk_size``, ``chunk_index``, and
+                ``chunk_split_strategy``.
+
+        Returns:
+            Tensor of shape ``(B, N, C)``.
+        """
+        chunk_size = kwargs.get("chunk_size")
+        chunk_index = kwargs.get("chunk_index")
+        chunk_split_strategy = kwargs.get("chunk_split_strategy", "uniform")
+
+        dtype_in = x.dtype
+        x, B, S, T = self._reshape_to_temporal(x, HW)
+
+        # NOTE: CP removed — single-GPU path only.
+        # 1. Global forward causal conv (cross-chunk context flows forward).
+        y_fwd, _ = conv(x)
+
+        # 2. Per-chunk backward causal conv (isolated within each chunk).
+        y_bwd = self._backward_causal_conv_per_chunk(
+            x,
+            conv,
+            T,
+            chunk_size,
+            chunk_index,
+            chunk_split_strategy,
+        )
+
+        # 3. Subtract the shared center tap to avoid double-counting x[t].
+        w_center = conv.weight[:, 0, -1]  # (channels,)
+        center_term = x * w_center.unsqueeze(0).unsqueeze(0)
+
+        y = y_fwd + y_bwd - center_term
+        if y.dtype != dtype_in:
+            y = y.to(dtype_in)
+
+        return self._reshape_from_temporal(y, B, S, T)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        HW: tuple[int, int, int] | None = None,
+        rotary_emb: torch.Tensor | None = None,
+        block_mask: torch.Tensor | None = None,
+        apply_output_gate: bool = True,
+        chunk_size: int | None = None,
+        chunk_split_strategy: str = "uniform",
+        chunk_index: list[int] | None = None,
+        **kwargs: object,
+    ) -> torch.Tensor:
+        """Apply chunk-causal GDN attention to a token sequence.
+
+        Args:
+            x: Input tensor of shape ``(B, N, C)``.
+            mask: Unused attention mask (kept for API compatibility).
+            HW: Tuple of ``(T, H, W)`` describing the token layout.
+            rotary_emb: Optional rotary embeddings for q/k.
+            block_mask: Unused block mask (kept for API compatibility).
+            apply_output_gate: When ``False``, return raw attention output
+                before the output gate and projection.
+            chunk_size: Uniform chunk size; ``None`` falls back to
+                bidirectional.
+            chunk_split_strategy: Boundary derivation strategy.
+            chunk_index: Explicit chunk boundary list (overrides
+                ``chunk_size``).
+            **kwargs: Extra arguments (``frame_valid_mask``,
+                ``precomputed_gates``, etc.).
+
+        Returns:
+            Tensor of shape ``(B, N, C)`` after attention and projection.
+        """
+        del mask, block_mask
+        frame_valid_mask = kwargs.get("frame_valid_mask", None)
+
+        if HW is None:
+            raise ValueError("HW (T, H, W) must be provided for GDN attention.")
+
+        B, N, C = x.shape
+        T, H, W = HW
+        S = H * W
+        token_valid_mask, beta_valid_mask, decay_valid_mask = self._prepare_frame_valid_masks(
+            frame_valid_mask,
+            B=B,
+            T=T,
+            S=S,
+            device=x.device,
+            dtype=x.dtype,
+        )
+        if token_valid_mask is not None:
+            x = x * token_valid_mask.view(B, N, 1)
+
+        # Projections.
+        qkv = self.qkv(x).reshape(B, N, 3, self.heads, self.dim)
+        q, k, v = qkv.unbind(2)
+        if token_valid_mask is not None:
+            token_mask_bnhd = token_valid_mask.view(B, N, 1, 1)
+            q = q * token_mask_bnhd
+            k = k * token_mask_bnhd
+            v = v * token_mask_bnhd
+
+        # Short convolution along T (per-chunk, before norm / kernel activation).
+        if self.conv_k is not None:
+            conv_kwargs = dict(
+                chunk_size=chunk_size,
+                chunk_index=chunk_index,
+                chunk_split_strategy=chunk_split_strategy,
+            )
+            if self.conv_q is not None:
+                q = self._apply_temporal_short_conv(q.reshape(B, N, C), self.conv_q, HW, **conv_kwargs).reshape(
+                    B, N, self.heads, self.dim
+                )
+            k = self._apply_temporal_short_conv(k.reshape(B, N, C), self.conv_k, HW, **conv_kwargs).reshape(
+                B, N, self.heads, self.dim
+            )
+            if self.conv_v is not None:
+                v = self._apply_temporal_short_conv(v.reshape(B, N, C), self.conv_v, HW, **conv_kwargs).reshape(
+                    B, N, self.heads, self.dim
+                )
+
+        # Apply Q/K norm on flattened channels (B, N, C) then reshape to heads.
+        q = self.q_norm(q.reshape(B, N, C)).reshape(B, N, self.heads, self.dim)
+        k = self.k_norm(k.reshape(B, N, C)).reshape(B, N, self.heads, self.dim)
+
+        # ReLU kernel.
+        q = self.kernel_func(q)
+        k = self.kernel_func(k)
+
+        k_scale = (self.dim**-0.5) * (S**-0.5)
+        k = k * k_scale
+
+        # Permute to (B, H, D, N) for processing.
+        q = q.permute(0, 2, 3, 1)
+        k = k.permute(0, 2, 3, 1)
+        v = v.permute(0, 2, 3, 1)
+        if token_valid_mask is not None:
+            token_mask_qkv = token_valid_mask.view(B, 1, 1, N)
+            q = q * token_mask_qkv
+            k = k * token_mask_qkv
+            v = v * token_mask_qkv
+
+        # RoPE preparation (numerator only).
+        if rotary_emb is not None:
+            q_rot = self._apply_rotary_emb(q, rotary_emb)
+            k_rot = self._apply_rotary_emb(k, rotary_emb)
+        else:
+            q_rot = q
+            k_rot = k
+        if token_valid_mask is not None:
+            token_mask_qkv = token_valid_mask.view(B, 1, 1, N)
+            q_rot = q_rot * token_mask_qkv
+            k_rot = k_rot * token_mask_qkv
+
+        # Gate computation (use pre-computed gates when available).
+        precomputed_gates = kwargs.get("precomputed_gates", None)
+        if precomputed_gates is not None:
+            beta, decay = precomputed_gates
+        else:
+            beta, decay = self._compute_frame_gates(x, HW)
+        if beta_valid_mask is not None:
+            beta = beta * beta_valid_mask.to(beta.dtype)
+        if decay_valid_mask is not None:
+            decay_m = decay_valid_mask.to(decay.dtype)
+            decay = decay * decay_m + (1.0 - decay_m)
+
+        # NOTE: CP removed — single-GPU path only.
+        # Run the frame-wise GDN update; force FP32 to preserve recurrent stability.
+        dtype_orig = x.dtype
+        recall_gate = self.recall_gate
+        if getattr(self, "fp32_attention", True):
+            q = q.float()
+            k = k.float()
+            v = v.float()
+            q_rot = q_rot.float()
+            k_rot = k_rot.float()
+            beta = beta.float()
+            decay = decay.float()
+            recall_gate = recall_gate.float()
+
+        # ==========================================
+        # Global Forward Pass (Always Causal)
+        # ==========================================
+        num_fwd, den_fwd = self.update_rule_func(
+            q, k, v, q_rot, k_rot, beta, decay, recall_gate=recall_gate, eps=self.eps, return_components=True
+        )
+
+        if chunk_size is None and chunk_index is None:
+            # Standard Global Backward (bidirectional fallback).
+            decay_bwd_input = decay
+            input_mask = torch.ones(B, 1, T, 1, 1, device=x.device, dtype=x.dtype)
+        else:
+            valid_chunk_index, _ = normalize_chunk_index(chunk_index, T, chunk_size, chunk_split_strategy)
+            decay_bwd_input = decay.clone()
+            boundaries = [idx for idx in valid_chunk_index if 0 < idx < T]
+            if boundaries:
+                # Force decay-to-zero at chunk boundaries (no leakage backward).
+                decay_bwd_input[:, :, boundaries] = 0.0
+            input_mask = torch.ones(B, 1, T, 1, 1, device=x.device, dtype=x.dtype)
+            if boundaries:
+                input_mask[:, :, boundaries] = 0.0
+
+        if beta_valid_mask is not None:
+            frame_input_mask = beta_valid_mask.to(input_mask.dtype).unsqueeze(-1)
+            input_mask = input_mask * frame_input_mask
+        if decay_valid_mask is not None:
+            decay_m = decay_valid_mask.to(decay_bwd_input.dtype)
+            decay_bwd_input = decay_bwd_input * decay_m + (1.0 - decay_m)
+
+        def to_time_structure(tensor: torch.Tensor) -> torch.Tensor:
+            return tensor.view(B, self.heads, self.dim, T, S).permute(0, 1, 3, 2, 4)
+
+        def from_time_structure(tensor: torch.Tensor) -> torch.Tensor:
+            return tensor.permute(0, 1, 3, 2, 4).reshape(B, self.heads, self.dim, N)
+
+        q_T = to_time_structure(q)
+        k_T = to_time_structure(k)
+        v_T = to_time_structure(v)
+        q_rot_T = to_time_structure(q_rot)
+        k_rot_T = to_time_structure(k_rot)
+
+        # Apply input mask before flip/shift (kills cross-boundary KV leakage).
+        k_T_masked = k_T * input_mask
+        v_T_masked = v_T * input_mask
+        k_rot_T_masked = k_rot_T * input_mask
+
+        q_bwd = torch.flip(q_T, dims=[2])
+        q_rot_bwd = torch.flip(q_rot_T, dims=[2])
+
+        k_bwd = flip_and_shift(k_T_masked, dim=2, shift_val=0.0)
+        v_bwd = flip_and_shift(v_T_masked, dim=2, shift_val=0.0)
+        k_rot_bwd = flip_and_shift(k_rot_T_masked, dim=2, shift_val=0.0)
+        beta_bwd = flip_and_shift(beta, dim=2, shift_val=0.0)
+        decay_bwd = flip_and_shift(decay_bwd_input, dim=2, shift_val=1.0)
+
+        k_bwd_flat = from_time_structure(k_bwd)
+        v_bwd_flat = from_time_structure(v_bwd)
+        q_bwd_flat = from_time_structure(q_bwd)
+        q_rot_bwd_flat = from_time_structure(q_rot_bwd)
+        k_rot_bwd_flat = from_time_structure(k_rot_bwd)
+
+        # === Run Backward Kernel ===
+        # When chunks are independent (chunk-causal), batch chunks along B
+        # and run a short scan per group instead of one long sequential
+        # scan over T.
+        _use_batched_bwd = chunk_size is not None and T > chunk_size + 1
+        if _use_batched_bwd:
+            num_bwd_flipped, den_bwd_flipped = self._batched_backward_scan(
+                q_bwd=q_bwd,
+                k_bwd=k_bwd,
+                v_bwd=v_bwd,
+                q_rot_bwd=q_rot_bwd,
+                k_rot_bwd=k_rot_bwd,
+                beta_bwd=beta_bwd,
+                decay_bwd=decay_bwd,
+                recall_gate=recall_gate,
+                B=B,
+                T=T,
+                S=S,
+                chunk_size=chunk_size,
+                chunk_index=chunk_index,
+                chunk_split_strategy=chunk_split_strategy,
+            )
+        else:
+            num_bwd_flipped, den_bwd_flipped = self.update_rule_func(
+                q_bwd_flat,
+                k_bwd_flat,
+                v_bwd_flat,
+                q_rot_bwd_flat,
+                k_rot_bwd_flat,
+                beta_bwd,
+                decay_bwd,
+                recall_gate=recall_gate,
+                eps=self.eps,
+                return_components=True,
+            )
+
+        def flip_back(tensor: torch.Tensor) -> torch.Tensor:
+            d_actual = tensor.shape[2]
+            t_struct = tensor.view(B, self.heads, d_actual, T, S)
+            return torch.flip(t_struct, dims=[3]).reshape(B, self.heads, d_actual, N)
+
+        num_bwd = flip_back(num_bwd_flipped)
+        den_bwd = flip_back(den_bwd_flipped)
+
+        total_num = num_fwd + num_bwd
+        total_den = den_fwd + den_bwd
+        out = total_num / (total_den + self.eps)
+
+        # Reshape and project output.
+        if getattr(self, "fp32_attention", True) and dtype_orig != torch.float32:
+            out = out.to(dtype_orig)
+
+        out = out.permute(0, 3, 1, 2)
+        N_out = out.shape[1]
+        out = out.reshape(B, N_out, C)
+        if token_valid_mask is not None:
+            out = out * token_valid_mask.view(B, N_out, 1).to(out.dtype)
+
+        if apply_output_gate:
+            out = self._apply_output_gate(out, x)
+            out = self.proj(out.to(self.proj.weight.dtype))
+            if token_valid_mask is not None:
+                out = out * token_valid_mask.view(B, N_out, 1).to(out.dtype)
+            return out
+        return out
+
+
 _frame_causal_mask_cache: dict[tuple[int, int, torch.device], torch.Tensor] = {}
 
 
@@ -1206,3 +1773,303 @@ def _forward_softmax_attn(
             out = out * F.silu(self.proj_gate(x))
         out = self.proj(out)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Chunk-causal softmax attention for hybrid GDN-Softmax architectures
+# ---------------------------------------------------------------------------
+
+# flex_attention for chunk-causal softmax (single-kernel, no O(N^2) mask).
+try:
+    from torch.nn.attention.flex_attention import BlockMask, create_block_mask
+    from torch.nn.attention.flex_attention import flex_attention as _flex_attention_raw
+
+    _flex_attention = torch.compile(_flex_attention_raw, dynamic=False, mode="max-autotune-no-cudagraphs")
+    _HAS_FLEX_ATTENTION_CHUNK = True
+except ImportError:
+    _HAS_FLEX_ATTENTION_CHUNK = False
+
+_chunk_causal_block_mask_cache: dict[tuple, BlockMask] = {}
+
+
+def _get_chunk_causal_block_mask(
+    chunk_boundaries: list[int],
+    S: int,
+    q_len: int,
+    kv_len: int,
+    q_frame_offset: int,
+    device: torch.device,
+) -> BlockMask:
+    """Build a flex_attention BlockMask for chunk-causal attention.
+
+    Token ``q_idx`` can attend to ``kv_idx`` iff ``chunk(q) >= chunk(kv)``,
+    i.e. ``kv_idx < chunk_end(q)``.  Uses the HiAR pattern: precompute an
+    ``ends`` tensor mapping each token to its chunk's exclusive end token
+    index.  Results are cached by
+    ``(chunk_boundaries, S, q_len, kv_len, q_frame_offset, device)``.
+    """
+    cache_key = (tuple(chunk_boundaries), S, q_len, kv_len, q_frame_offset, device)
+    if cache_key in _chunk_causal_block_mask_cache:
+        return _chunk_causal_block_mask_cache[cache_key]
+
+    # flex_attention requires Q_LEN and KV_LEN to be multiples of 128.
+    q_pad = (128 - q_len % 128) % 128
+    kv_pad = (128 - kv_len % 128) % 128
+    Q_LEN = q_len + q_pad
+    KV_LEN = kv_len + kv_pad
+
+    # Build per-token ``ends`` array: ends[tok] = exclusive end token index
+    # of the chunk that ``tok`` belongs to (in global KV token space).
+    # Padded tokens map to KV_LEN so they attend to everything (masked later).
+    ends_kv = torch.full((KV_LEN,), KV_LEN, device=device, dtype=torch.long)
+    for ci in range(len(chunk_boundaries) - 1):
+        tok_start = chunk_boundaries[ci] * S
+        tok_end = chunk_boundaries[ci + 1] * S
+        if tok_end > KV_LEN:
+            tok_end = KV_LEN
+        if tok_start < KV_LEN:
+            ends_kv[tok_start:tok_end] = tok_end
+
+    # For Q tokens: map local Q index -> global token, then look up chunk end.
+    q_offset_tokens = q_frame_offset * S
+    ends_q = torch.full((Q_LEN,), KV_LEN, device=device, dtype=torch.long)
+    for qi in range(min(q_len, Q_LEN)):
+        global_qi = qi + q_offset_tokens
+        if global_qi < len(ends_kv):
+            ends_q[qi] = ends_kv[global_qi]
+
+    def mask_fn(b, h, q_idx, kv_idx):
+        return kv_idx < ends_q[q_idx]
+
+    block_mask = create_block_mask(
+        mask_fn,
+        B=None,
+        H=None,
+        Q_LEN=Q_LEN,
+        KV_LEN=KV_LEN,
+        _compile=False,
+        device=device,
+    )
+
+    _chunk_causal_block_mask_cache[cache_key] = block_mask
+    return block_mask
+
+
+_chunk_causal_mask_cache: dict[tuple, torch.Tensor] = {}
+
+
+def _get_chunk_causal_mask(
+    T: int,
+    S: int,
+    chunk_boundaries: list[int],
+    device: torch.device,
+) -> torch.Tensor:
+    """Chunk-wise block-causal mask for video generation.
+
+    Full attention within each chunk (all spatial tokens across all frames
+    in the chunk attend to each other), causal across chunks (tokens in
+    chunk C attend to all tokens in chunks 0..C only).
+
+    Args:
+        T: Number of temporal frames.
+        S: Number of spatial tokens per frame (``H * W``).
+        chunk_boundaries: Sorted chunk boundary list ``[0, c1, ..., T]``.
+        device: Target device for the mask tensor.
+
+    Returns:
+        Boolean mask ``(1, 1, T*S, T*S)`` where ``True`` = allowed to attend.
+    """
+    key = (T, S, tuple(chunk_boundaries), device)
+    if key not in _chunk_causal_mask_cache:
+        frame_to_chunk = torch.zeros(T, device=device, dtype=torch.long)
+        for i in range(len(chunk_boundaries) - 1):
+            frame_to_chunk[chunk_boundaries[i] : chunk_boundaries[i + 1]] = i
+        token_to_chunk = frame_to_chunk.repeat_interleave(S)
+        mask = token_to_chunk.unsqueeze(1) >= token_to_chunk.unsqueeze(0)
+        _chunk_causal_mask_cache[key] = mask.unsqueeze(0).unsqueeze(0)
+    return _chunk_causal_mask_cache[key]
+
+
+def _forward_softmax_attn_chunk_causal(
+    self: GDN,
+    x: torch.Tensor,
+    HW: tuple[int, int, int],
+    rotary_emb: torch.Tensor | None,
+    chunk_size: int | None,
+    chunk_split_strategy: str,
+    chunk_index: list[int] | None,
+    apply_output_gate: bool = True,
+    **kwargs: object,
+) -> torch.Tensor:
+    """Chunk-causal softmax attention (SDPA / flex_attention) reusing GDN parameters.
+
+    Used by ``ChunkCausalSoftmaxAttn``.  Reuses ``qkv``, ``q_norm``,
+    ``k_norm``, ``proj``, and the output gate from the parent ``GDN``
+    parameter set.  When ``chunk_size`` is ``None`` or ``>= T`` the
+    attention degenerates to fully bidirectional softmax.
+    """
+    B, N, C = x.shape
+    T, H, W = HW
+    S = H * W
+
+    frame_valid_mask = kwargs.get("frame_valid_mask", None)
+    token_valid_mask, _, _ = GDN._prepare_frame_valid_masks(
+        frame_valid_mask,
+        B=B,
+        T=T,
+        S=S,
+        device=x.device,
+        dtype=x.dtype,
+    )
+    if token_valid_mask is not None:
+        x = x * token_valid_mask.view(B, N, 1)
+
+    qkv = self.qkv(x).reshape(B, N, 3, self.heads, self.dim)
+    q, k, v = qkv.unbind(2)
+    if token_valid_mask is not None:
+        m = token_valid_mask.view(B, N, 1, 1)
+        q, k, v = q * m, k * m, v * m
+
+    q = self.q_norm(q.reshape(B, N, C)).reshape(B, N, self.heads, self.dim)
+    k = self.k_norm(k.reshape(B, N, C)).reshape(B, N, self.heads, self.dim)
+
+    if rotary_emb is not None:
+        q_perm = q.permute(0, 2, 3, 1)
+        k_perm = k.permute(0, 2, 3, 1)
+        q_perm = GDN._apply_rotary_emb(q_perm, rotary_emb)
+        k_perm = GDN._apply_rotary_emb(k_perm, rotary_emb)
+        q = q_perm.permute(0, 3, 1, 2)
+        k = k_perm.permute(0, 3, 1, 2)
+
+    if token_valid_mask is not None:
+        m = token_valid_mask.view(B, N, 1, 1)
+        q, k, v = q * m, k * m, v * m
+
+    q = q.transpose(1, 2)  # (B, H, N, D)
+    k = k.transpose(1, 2)
+    v = v.transpose(1, 2)
+
+    dtype_orig = x.dtype
+    if q.dtype == torch.float32:
+        q, k, v = q.bfloat16(), k.bfloat16(), v.bfloat16()
+
+    # NOTE: CP removed — single-GPU path only.
+    _chunk_causal = chunk_size is not None and chunk_size < T
+
+    if _chunk_causal:
+        chunk_boundaries, _ = normalize_chunk_index(chunk_index, T, chunk_size, chunk_split_strategy)
+        q_len = T * S
+        kv_len = T * S
+        q_frame_offset = 0
+
+        if _HAS_FLEX_ATTENTION_CHUNK:
+            # flex_attention: single compiled kernel with block-sparse mask.
+            block_mask = _get_chunk_causal_block_mask(chunk_boundaries, S, q_len, kv_len, q_frame_offset, x.device)
+            q_pad = (128 - q_len % 128) % 128
+            kv_pad = (128 - kv_len % 128) % 128
+            if q_pad > 0:
+                q = F.pad(q, (0, 0, 0, q_pad))
+            if kv_pad > 0:
+                k = F.pad(k, (0, 0, 0, kv_pad))
+                v = F.pad(v, (0, 0, 0, kv_pad))
+            out = _flex_attention(q, k, v, block_mask=block_mask)
+            if q_pad > 0:
+                out = out[:, :, :q_len, :]
+        else:
+            # Fallback: per-chunk loop with head_dim padding for FlashAttention.
+            D = q.shape[-1]
+            _need_pad = D not in (32, 64, 128, 256) and D < 256
+            if _need_pad:
+                _pad_to = 128 if D <= 128 else 256
+                _pad_size = _pad_to - D
+                q = F.pad(q, (0, _pad_size))
+                k = F.pad(k, (0, _pad_size))
+                v = F.pad(v, (0, _pad_size))
+            out_chunks: list[torch.Tensor] = []
+            for ci in range(len(chunk_boundaries) - 1):
+                c_start = chunk_boundaries[ci]
+                c_end = chunk_boundaries[ci + 1]
+                q_chunk = q[:, :, c_start * S : c_end * S, :]
+                out_chunk = F.scaled_dot_product_attention(q_chunk, k[:, :, : c_end * S, :], v[:, :, : c_end * S, :])
+                out_chunks.append(out_chunk)
+            out = torch.cat(out_chunks, dim=2)
+            if _need_pad:
+                out = out[..., :D]
+    else:
+        # Fully bidirectional softmax (no chunking).
+        D = q.shape[-1]
+        _need_pad = D not in (32, 64, 128, 256) and D < 256
+        if _need_pad:
+            _pad_to = 128 if D <= 128 else 256
+            _pad_size = _pad_to - D
+            q = F.pad(q, (0, _pad_size))
+            k = F.pad(k, (0, _pad_size))
+            v = F.pad(v, (0, _pad_size))
+        out = F.scaled_dot_product_attention(q, k, v)
+        if _need_pad:
+            out = out[..., :D]
+
+    if out.dtype != dtype_orig:
+        out = out.to(dtype_orig)
+
+    out = out.transpose(1, 2).reshape(B, N, C)
+    if token_valid_mask is not None:
+        out = out * token_valid_mask.view(B, N, 1).to(out.dtype)
+
+    if apply_output_gate:
+        out = self._apply_output_gate(out, x)
+        out = self.proj(out.to(dtype_orig))
+        if token_valid_mask is not None:
+            out = out * token_valid_mask.view(B, N, 1).to(out.dtype)
+        return out
+    return out
+
+
+@ATTENTION_BLOCKS.register_module()
+class ChunkCausalSoftmaxAttn(ChunkCausalGDN):
+    """Chunk-causal softmax attention with GDN-compatible parameter layout.
+
+    Inherits all parameters from ``ChunkCausalGDN`` for checkpoint
+    compatibility.  GDN-specific parameters (``beta_proj``, ``gate_proj``,
+    ``A_log``, ``dt_bias``, ``recall_gate``) are present but unused in
+    forward.
+
+    Uses ``F.scaled_dot_product_attention`` (or ``flex_attention`` when
+    available) with a chunk-wise causal mask: full bidirectional attention
+    within each chunk, causal across chunks.  This matches the attention
+    pattern of ``ChunkCausalGDN`` while using exact softmax instead of the
+    linear GDN recurrence.
+    """
+
+    def __init__(self, *args: object, conv_kernel_size: int = 0, **kwargs: object) -> None:
+        del conv_kernel_size  # Softmax variant always uses conv_kernel_size=0.
+        super().__init__(*args, conv_kernel_size=0, **kwargs)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        HW: tuple[int, int, int] | None = None,
+        rotary_emb: torch.Tensor | None = None,
+        block_mask: torch.Tensor | None = None,
+        apply_output_gate: bool = True,
+        chunk_size: int | None = None,
+        chunk_split_strategy: str = "uniform",
+        chunk_index: list[int] | None = None,
+        **kwargs: object,
+    ) -> torch.Tensor:
+        """Apply chunk-causal softmax attention to a token sequence."""
+        del mask, block_mask
+        if HW is None:
+            raise ValueError("HW (T, H, W) must be provided for ChunkCausalSoftmaxAttn.")
+        return _forward_softmax_attn_chunk_causal(
+            self,
+            x,
+            HW,
+            rotary_emb,
+            chunk_size=chunk_size,
+            chunk_split_strategy=chunk_split_strategy,
+            chunk_index=chunk_index,
+            apply_output_gate=apply_output_gate,
+            **kwargs,
+        )

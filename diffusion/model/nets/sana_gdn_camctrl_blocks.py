@@ -50,6 +50,7 @@ from .sana_camctrl_blocks import _maybe_drop_cam_branch, prepare_prope_fns
 from .sana_gdn_blocks import (
     GDN,
     BidirectionalGDN,
+    ChunkCausalGDN,
     _forward_softmax_attn,
     flip_and_shift,
 )
@@ -1345,6 +1346,296 @@ class BidirectionalGDNUCPESinglePathLiteLA(BidirectionalGDNUCPELiteLAPostUCPERen
         if token_valid_mask is not None:
             out = out * token_valid_mask.view(B, N, 1).to(out.dtype)
         return out
+
+
+class ChunkCausalGDNUCPESinglePathLiteLA(BidirectionalGDNUCPESinglePathLiteLA, ChunkCausalGDN):
+    """Chunk-causal variant of ``BidirectionalGDNUCPESinglePathLiteLA``.
+
+    Main branch: chunk-causal GDN (inherited via MRO from
+    :class:`ChunkCausalGDN`).  Camera branch: single-path (numerator-only)
+    delta rule with chunk-boundary isolation in the backward pass.
+
+    All parameter names match ``BidirectionalGDNUCPESinglePathLiteLA``
+    exactly, so checkpoints from bidirectional training load directly.
+    The only behavioral difference is that the backward recurrence in the
+    camera branch is isolated at chunk boundaries (decay and inputs
+    zeroed), preventing future chunk information from leaking into past
+    chunks.
+    """
+
+    # Class hook so subclasses can swap the main-branch implementation
+    # (e.g. a Triton-fused inference variant) without re-implementing
+    # :meth:`forward`.  Defaults to the production PyTorch chunk-causal scan.
+    _main_chunk_causal_class = ChunkCausalGDN
+
+    def _forward_cam_branch(
+        self,
+        x: torch.Tensor,
+        HW: tuple[int, int, int],
+        camera_conditions: torch.Tensor,
+        rotary_emb: torch.Tensor | None,
+        **kwargs: object,
+    ) -> torch.Tensor:
+        """Camera branch forward with per-chunk backward isolation.
+
+        For single-chunk (``chunk_size >= T`` or ``chunk_size is None``)
+        delegates to the parent's bidirectional camera branch for
+        identical forward and backward behavior.  For multi-chunk, runs
+        the global causal single-path forward followed by an isolated
+        per-chunk backward.
+        """
+        B, N, _ = x.shape
+        T, H, W = HW
+        S = H * W
+        dtype_orig = x.dtype
+
+        # For single-chunk (or no chunk_size), delegate to the parent's
+        # bidirectional camera branch for identical forward AND backward
+        # behavior.
+        chunk_size = kwargs.get("chunk_size", None)
+        if chunk_size is None or chunk_size >= T:
+            return BidirectionalGDNUCPESinglePathLiteLA._forward_cam_branch(
+                self,
+                x,
+                HW,
+                camera_conditions,
+                rotary_emb,
+                **kwargs,
+            )
+
+        chunk_index = kwargs.get("chunk_index", None)
+        chunk_split_strategy = kwargs.get("chunk_split_strategy", "uniform")
+
+        token_valid_mask, beta_valid_mask, decay_valid_mask = self._prepare_frame_valid_masks(
+            kwargs.get("frame_valid_mask", None),
+            B=B,
+            T=T,
+            S=S,
+            device=x.device,
+            dtype=x.dtype,
+        )
+
+        q_cam, _, v_cam_trans, q_cam_trans, k_cam_trans, apply_fn_o, inflation_sq = self._prepare_cam_qkv(
+            x,
+            HW,
+            camera_conditions,
+            rotary_emb,
+            token_valid_mask=token_valid_mask,
+            **kwargs,
+        )
+        if token_valid_mask is not None:
+            token_mask_qkv = token_valid_mask.view(B, 1, 1, N)
+            q_cam = q_cam * token_mask_qkv
+            v_cam_trans = v_cam_trans * token_mask_qkv
+            q_cam_trans = q_cam_trans * token_mask_qkv
+            k_cam_trans = k_cam_trans * token_mask_qkv
+
+        precomputed_gates = kwargs.get("precomputed_gates", None)
+        if precomputed_gates is not None:
+            beta, decay = precomputed_gates
+        else:
+            beta, decay = self._compute_frame_gates(x, HW)
+
+        # Dynamic Beta Discounting (same as bidirectional).
+        inflation_sq_spatial = inflation_sq.view(B, self.cam_heads, T, S)
+        frame_inflation_sq = inflation_sq_spatial.mean(dim=-1)
+        if beta.ndim == 3:
+            beta = beta / frame_inflation_sq.clamp_min(1.0)
+        elif beta.ndim == 4:
+            beta = beta / frame_inflation_sq.unsqueeze(-1).clamp_min(1.0)
+
+        if beta_valid_mask is not None:
+            beta = beta * beta_valid_mask.to(beta.dtype)
+        if decay_valid_mask is not None:
+            decay_m = decay_valid_mask.to(decay.dtype)
+            decay = decay * decay_m + (1.0 - decay_m)
+
+        H_heads = self.cam_heads
+        D_head = self.cam_head_dim
+
+        # NOTE: CP removed — single-GPU path only.
+        # Non-CP path: same as bidirectional single-path but with
+        # chunk-boundary isolation in the backward pass.
+        # Forward: global causal single-path (unchanged from bidirectional).
+        out_fwd = self._run_cam_single_path(
+            q_cam_trans,
+            k_cam_trans,
+            v_cam_trans,
+            beta,
+            decay,
+        )
+
+        # Backward: run per-chunk independently to ensure isolation.
+        def to_time(t: torch.Tensor) -> torch.Tensor:
+            return t.view(B, H_heads, D_head, T, S).permute(0, 1, 3, 2, 4)
+
+        if chunk_size is not None or chunk_index is not None:
+            valid_chunk_index, _ = normalize_chunk_index(
+                chunk_index,
+                T,
+                chunk_size,
+                chunk_split_strategy,
+            )
+        else:
+            valid_chunk_index = [0, T]
+
+        q_rot_T = to_time(q_cam_trans)  # (B, H, T, D, S)
+        k_rot_T = to_time(k_cam_trans)
+        v_T = to_time(v_cam_trans)
+
+        out_bwd_chunks: list[torch.Tensor] = []
+        for ci in range(len(valid_chunk_index) - 1):
+            cs = valid_chunk_index[ci]
+            ce = valid_chunk_index[ci + 1]
+            chunk_len = ce - cs
+
+            q_chunk = q_rot_T[:, :, cs:ce]  # (B, H, chunk_len, D, S)
+            k_chunk = k_rot_T[:, :, cs:ce]
+            v_chunk = v_T[:, :, cs:ce]
+
+            # Frame-level beta/decay for this chunk.
+            if beta.ndim == 3:
+                beta_chunk = beta[:, :, cs:ce]
+            elif beta.ndim == 4:
+                beta_chunk = beta[:, :, cs:ce, :]
+            else:
+                beta_chunk = beta[:, :, cs:ce]
+            decay_chunk = decay[:, :, cs:ce]
+
+            # Flip for backward (exclusive: t+1..ce).
+            q_bwd = torch.flip(q_chunk, dims=[2])
+            k_bwd = flip_and_shift(k_chunk, dim=2, shift_val=0.0)
+            v_bwd = flip_and_shift(v_chunk, dim=2, shift_val=0.0)
+            beta_bwd = flip_and_shift(beta_chunk, dim=2, shift_val=0.0)
+            decay_bwd = flip_and_shift(decay_chunk, dim=2, shift_val=1.0)
+
+            chunk_N = chunk_len * S
+
+            def _flatten_chunk(t: torch.Tensor, _n: int = chunk_N) -> torch.Tensor:
+                return t.permute(0, 1, 3, 2, 4).reshape(B, H_heads, D_head, _n)
+
+            out_bwd_chunk = self._run_cam_single_path(
+                _flatten_chunk(q_bwd),
+                _flatten_chunk(k_bwd),
+                _flatten_chunk(v_bwd),
+                beta_bwd,
+                decay_bwd,
+            )
+            # Flip back to forward time order.
+            out_bwd_chunk_t = out_bwd_chunk.view(B, H_heads, D_head, chunk_len, S)
+            out_bwd_chunks.append(torch.flip(out_bwd_chunk_t, dims=[3]))
+
+        out_bwd = torch.cat(out_bwd_chunks, dim=3)  # (B, H, D, T*S)
+        out_bwd = out_bwd.reshape(B, H_heads, D_head, N)
+        out = out_fwd + out_bwd
+
+        if getattr(self, "fp32_attention", True) and dtype_orig != torch.float32:
+            out = out.to(dtype_orig)
+        if token_valid_mask is not None:
+            out = out * token_valid_mask.view(B, 1, 1, N).to(out.dtype)
+
+        out_before_apply_fn_o = out
+        out = apply_fn_o(out.transpose(-1, -2)).transpose(-1, -2).contiguous()
+        self._maybe_record_cam_output_stats(out_before_apply_fn_o, out, token_valid_mask=token_valid_mask)
+        out = out.reshape(B, self.cam_dim, N).permute(0, 2, 1)
+        if token_valid_mask is not None:
+            out = out * token_valid_mask.view(B, N, 1).to(out.dtype)
+        return out
+
+    def _apply_temporal_short_conv(
+        self,
+        x: torch.Tensor,
+        conv: ShortConvolution,
+        HW: tuple[int, int, int],
+        **kwargs: object,
+    ) -> torch.Tensor:
+        """Route short conv: chunk-causal when chunk boundaries exist, else bidirectional.
+
+        For single-chunk (``chunk_size >= T``) or no chunk_size, use the
+        bidirectional short conv (identical forward AND backward to the
+        parent class).  For multi-chunk, use chunk-causal short conv to
+        enforce causality.
+        """
+        chunk_size = kwargs.get("chunk_size", None)
+        T = HW[0]
+        if chunk_size is not None and chunk_size < T:
+            return ChunkCausalGDN._apply_temporal_short_conv(self, x, conv, HW, **kwargs)
+        return BidirectionalGDN._apply_temporal_short_conv(self, x, conv, HW, **kwargs)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        HW: tuple[int, int, int] | None = None,
+        rotary_emb: torch.Tensor | None = None,
+        block_mask: torch.Tensor | None = None,
+        camera_conditions: torch.Tensor | None = None,
+        chunk_size: int | None = None,
+        **kwargs: object,
+    ) -> torch.Tensor:
+        """Dual-branch forward: chunk-causal GDN main + single-path UCPE camera.
+
+        Overrides ``_GDNUCPEBase.forward`` to ensure the main branch calls
+        ``ChunkCausalGDN.forward`` (not ``BidirectionalGDN.forward`` via
+        MRO) when multi-chunk; otherwise falls back to bidirectional.
+        """
+        if self.cam_debug_ratios:
+            self.reset_cam_debug_stats()
+        if self.training:
+            self._cam_debug_step_counter += 1
+
+        # Pre-compute shared gates once.
+        if HW is not None:
+            precomputed_gates = self._compute_frame_gates(x, HW)
+        else:
+            precomputed_gates = None
+
+        # Main branch: route based on chunk_size vs T.
+        # For single-chunk (chunk_size >= T), use BidirectionalGDN for
+        # identical forward AND backward behavior.  For multi-chunk, use
+        # the swappable ``_main_chunk_causal_class`` (default
+        # :class:`ChunkCausalGDN`).
+        T_main = HW[0] if HW is not None else 0
+        _use_chunk_causal = chunk_size is not None and chunk_size < T_main
+        _main_cls = self._main_chunk_causal_class if _use_chunk_causal else BidirectionalGDN
+        main_raw = _main_cls.forward(
+            self,
+            x,
+            mask=mask,
+            HW=HW,
+            rotary_emb=rotary_emb,
+            block_mask=block_mask,
+            apply_output_gate=False,
+            chunk_size=chunk_size,
+            precomputed_gates=precomputed_gates,
+            **kwargs,
+        )
+
+        # Camera branch (single-path with chunk-causal isolation).
+        cam_contrib: torch.Tensor | int = 0
+        camera_conditions = _maybe_drop_cam_branch(
+            camera_conditions,
+            kwargs.get("cam_branch_drop_prob", 0.0),
+            self.training,
+            x.device,
+        )
+        if camera_conditions is not None:
+            if HW is None:
+                raise ValueError("HW must be provided for UCPE camera branch.")
+            cam_raw = self._forward_cam_branch(
+                x,
+                HW,
+                camera_conditions,
+                rotary_emb,
+                chunk_size=chunk_size,
+                precomputed_gates=precomputed_gates,
+                **kwargs,
+            )
+            cam_contrib = self.out_proj_cam(cam_raw)
+
+        combined = main_raw + cam_contrib
+        combined = self._apply_output_gate(combined, x)
+        return self.proj(combined.to(self.proj.weight.dtype))
 
 
 def _prepare_cam_qkv_softmax(

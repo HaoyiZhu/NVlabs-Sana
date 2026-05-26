@@ -66,6 +66,7 @@ from diffusion.model.builder import (
 )
 from diffusion.model.utils import get_weight_dtype
 from diffusion.refiner.diffusers_ltx2_refiner import STAGE_2_DISTILLED_SIGMA_VALUES, DiffusersLTX2Refiner
+from diffusion.scheduler.self_forcing_flow_euler_sampler import SelfForcingFlowEulerCamCtrl
 from diffusion.utils.action_overlay import apply_overlay
 from diffusion.utils.cam_utils import compute_raymap, get_pose_inverse
 from diffusion.utils.camctrl_config import ModelVideoCamCtrlConfig, model_video_camctrl_init_config
@@ -75,7 +76,7 @@ from diffusion.utils.logger import get_root_logger
 from sana.tools import resolve_hf_path
 from tools.download import find_model
 
-SamplingAlgo = Literal["flow_euler_ltx", "flow_euler", "flow_dpm-solver"]
+SamplingAlgo = Literal["flow_euler_ltx", "flow_euler", "flow_dpm-solver", "self_forcing"]
 
 # Sana-WM is trained at this single resolution.
 TARGET_HEIGHT = 704
@@ -86,6 +87,10 @@ MIN_FOV_DEG = 25.0
 MAX_FOV_DEG = 120.0
 
 # Public release on Hugging Face. Override on the CLI for local files.
+# NOTE: The default HF checkpoint is bidirectional and is incompatible with
+# ``--sampling_algo=self_forcing``. Self-forcing requires a chunk-causal trained
+# checkpoint (HF release pending) — pass ``--model_path`` and a matching
+# ``--config`` pointing to a chunk-causal model when using that algorithm.
 HF_REPO = "Efficient-Large-Model/SANA-WM_bidirectional"
 HF_DEFAULTS = {
     "model_path": f"hf://{HF_REPO}/dit/sana_wm_1600m_720p.safetensors",
@@ -131,6 +136,12 @@ class GenerationParams:
     seed: int = 42
     negative_prompt: str = ""
     sampling_algo: SamplingAlgo = "flow_euler_ltx"
+    # Self-forcing autoregressive sampler knobs (only used when
+    # ``sampling_algo == "self_forcing"``).
+    num_cached_blocks: int = 2
+    sink_token: bool = False
+    num_frame_per_block: int = 3
+    denoising_step_list: list[int] | None = None
 
 
 @dataclass
@@ -766,6 +777,7 @@ class SanaWMPipeline:
             model_kwargs,
             chunk_index,
             generator,
+            params,
         )
         torch.cuda.empty_cache()
         return samples.detach()
@@ -791,6 +803,7 @@ class SanaWMPipeline:
         model_kwargs: dict,
         chunk_index: object,
         generator: torch.Generator,
+        params: GenerationParams,
     ) -> torch.Tensor:
         base = dict(
             condition=cond, uncondition=neg, cfg_scale=cfg_scale, flow_shift=flow_shift, model_kwargs=model_kwargs
@@ -810,6 +823,35 @@ class SanaWMPipeline:
                 model_kwargs=model_kwargs,
                 schedule="FLOW",
             ).sample(z, steps=steps, order=2, skip_type="time_uniform_flow", method="multistep", flow_shift=flow_shift)
+        if algo == "self_forcing":
+            if chunk_index is None:
+                raise ValueError(
+                    "--sampling_algo=self_forcing requires the config to expose chunk_index "
+                    "(chunk-causal model). The default bidirectional Sana-WM checkpoint is "
+                    "incompatible; supply a chunk-causal --config and --model_path."
+                )
+            # ``use_softmax_attention=True`` selects the 10-slot accumulator
+            # (``_accumulate_softmax_kv_cache``) which transparently handles both
+            # the old concat-layout and the new state-or-concat dual-mode flag in
+            # slot 6 — required for the hybrid GDN+Softmax chunk-causal Sana-WM.
+            solver = SelfForcingFlowEulerCamCtrl(
+                self.model,
+                condition=cond,
+                uncondition=neg,
+                cfg_scale=cfg_scale,
+                flow_shift=flow_shift,
+                model_kwargs=model_kwargs,
+                base_chunk_frames=params.num_frame_per_block,
+                num_cached_blocks=params.num_cached_blocks,
+                sink_token=params.sink_token,
+                use_softmax_attention=True,
+            )
+            return solver.sample(
+                z,
+                steps=steps,
+                generator=generator,
+                denoising_step_list=params.denoising_step_list,
+            )
         raise ValueError(f"Unknown sampling_algo: {algo}")
 
     # ------- stage 2: decode -------
@@ -927,7 +969,37 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cfg_scale", type=float, default=5.0)
     p.add_argument("--flow_shift", type=float, default=None, help="Override the scheduler's inference flow_shift.")
     p.add_argument(
-        "--sampling_algo", default="flow_euler_ltx", choices=["flow_euler_ltx", "flow_euler", "flow_dpm-solver"]
+        "--sampling_algo",
+        default="flow_euler_ltx",
+        choices=["flow_euler_ltx", "flow_euler", "flow_dpm-solver", "self_forcing"],
+    )
+    p.add_argument(
+        "--num_cached_blocks",
+        type=int,
+        default=2,
+        help="Self-forcing: number of past chunks to retain in KV cache "
+        "(set to a sliding-window size; -1 keeps all). Only used when "
+        "--sampling_algo=self_forcing.",
+    )
+    p.add_argument(
+        "--sink_token",
+        action="store_true",
+        help="Self-forcing: anchor chunk 0 in the KV cache permanently as a "
+        "sink token. Only used when --sampling_algo=self_forcing.",
+    )
+    p.add_argument(
+        "--num_frame_per_block",
+        type=int,
+        default=3,
+        help="Self-forcing: number of latent frames per autoregressive chunk. " "Must match the model's chunk_size.",
+    )
+    p.add_argument(
+        "--denoising_step_list",
+        type=str,
+        default="",
+        help="Self-forcing distilled student schedule, comma-separated integer "
+        "timesteps that must end with 0 (e.g., '1000,750,500,250,0'). When "
+        "provided, --step is ignored and these exact timesteps are used.",
     )
     p.add_argument("--negative_prompt", default="")
     p.add_argument("--seed", type=int, default=42)
@@ -1061,6 +1133,12 @@ def main() -> None:
         logger=logger,
     )
 
+    denoising_step_list: list[int] | None = None
+    if args.denoising_step_list:
+        denoising_step_list = [int(t.strip()) for t in args.denoising_step_list.split(",") if t.strip()]
+        if not denoising_step_list or denoising_step_list[-1] != 0:
+            raise SystemExit("--denoising_step_list must be a comma-separated list ending with 0.")
+
     params = GenerationParams(
         num_frames=num_frames,
         fps=args.fps,
@@ -1070,6 +1148,10 @@ def main() -> None:
         seed=args.seed,
         negative_prompt=args.negative_prompt,
         sampling_algo=args.sampling_algo,
+        num_cached_blocks=args.num_cached_blocks,
+        sink_token=args.sink_token,
+        num_frame_per_block=args.num_frame_per_block,
+        denoising_step_list=denoising_step_list,
     )
 
     out = pipeline.generate(cropped, prompt, c2w, intrinsics_vec4, params)
