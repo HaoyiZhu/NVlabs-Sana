@@ -27,7 +27,12 @@ Core contributions:
 
 SANA-WM completes pre-training in 15 days on 64 H100s and generates a 60s 720p clip on a single GPU; the distilled variant runs on an RTX 5090 with NVFP4 quantisation.
 
-> **Note** This is the initial release and currently ships **bidirectional inference only**. More variants are on the way — stay tuned.
+> **Note** This release ships two inference paths: a **bidirectional** pipeline
+> (full-sequence Stage 1 + sink-bidirectional refiner) and a **streaming**
+> pipeline (chunk-causal distilled Stage 1 + chunk-causal refiner + causal-VAE
+> decoder, all overlapped on three CUDA streams and written progressively to
+> MP4). Streaming weights are released under
+> [`SANA-WM_streaming`](https://huggingface.co/Efficient-Large-Model/SANA-WM_streaming).
 
 ## ⚙️ Environment Setup
 
@@ -88,6 +93,51 @@ For tight VRAM budgets, opt in to lazy-load + CPU offload:
 ... --offload_vae --offload_refiner
 ```
 
+### Streaming inference
+
+The streaming pipeline replaces all three full-sequence stages with chunk-causal
+variants and emits one decoded chunk per AR block straight into a progressive
+MP4. Stage 1 runs the 4-step distilled student (CFG-baked-in, runs at
+`cfg_scale=1`), the refiner runs chunk-causal AR with a sliding KV window, and
+the causal LTX-2 VAE decodes chunk-by-chunk.
+
+Drop the streaming weights into `pretrained_models/sana_wm_streaming/` (DiT,
+refiner, causal VAE, and YAML are all under the
+[`SANA-WM_streaming`](https://huggingface.co/Efficient-Large-Model/SANA-WM_streaming)
+HF repo) and run:
+
+```bash
+python inference_video_scripts/inference_sana_wm_streaming.py \
+  --image       asset/sana_wm/demo_0.png \
+  --prompt      asset/sana_wm/demo_0.txt \
+  --action      "w-120,lw-80,w-100,jw-80,dw-100,w-120,aw-80,w-100,jw-60,w-121" \
+  --num_frames  961 \
+  --output_dir  results/sana_wm_streaming
+```
+
+Output lands at `results/sana_wm_streaming/<name>_streaming.mp4` and grows in
+place — you can watch it while inference continues. Reaches **~0.93× realtime
+on a single H100** after a one-time `torch.compile` warmup (~3 min cold, ~30 s
+warm cache; the warmup amortises across runs that reuse the same shapes).
+
+All speed-critical knobs are baked into the script as defaults — `torch.compile`
+on the VAE decoder and refiner transformer (`max-autotune-no-cudagraphs` mode),
+flash-only SDPA, Inductor `coordinate_descent_tuning` + `epilogue_fusion`, cuDNN
+benchmark, and the expandable CUDA allocator. There is no slow/fast toggle; the
+script is the fast config.
+
+Overrides for advanced use:
+
+- `--streaming_root <path>` — directory holding `sana_dit/`, `ltx2_causal_vae/`,
+  `refiner_diffusers/`, `gemma3_12b/`, and the YAML (default
+  `pretrained_models/sana_wm_streaming`).
+- `--config / --model_path / --causal_vae_path / --refiner_root /
+  --refiner_gemma_root` — point at non-default weight paths.
+- `--num_frame_per_block` (default 3, must match the checkpoint's
+  `chunk_size`), `--denoising_step_list` (default
+  `"1000,960,889,727,0"`), `--refiner_block_size` (3), `--refiner_kv_max_frames`
+  (11) — change the canonical recipe at your own quality risk.
+
 ## 🎛️ Argument Reference
 
 | Argument | Format / Default |
@@ -109,6 +159,7 @@ For tight VRAM budgets, opt in to lazy-load + CPU offload:
 | `--no_action_overlay` | Skip the WASD + joystick overlay on the output video. |
 | `--offload_vae` | Move the VAE to CPU between encode / decode steps. |
 | `--offload_refiner` | Lazy-load the LTX-2 refiner only when needed; release afterwards. |
+| `--sampling_algo` | `flow_euler_ltx` (default, bidirectional). For streaming use the dedicated `inference_sana_wm_streaming.py`. |
 
 ## 📁 HF Repository Layout
 
@@ -121,6 +172,15 @@ For tight VRAM budgets, opt in to lazy-load + CPU offload:
 | LTX-2 refiner (Stage 2) | `refiner/{transformer,connectors}/` | 38 GB |
 | Gemma text encoder for the refiner | `refiner/text_encoder/` | 46 GB |
 | Inference config | `config.yaml` | — |
+
+`Efficient-Large-Model/SANA-WM_streaming` (streaming variant):
+
+| Component | Path |
+|------------------------------------|----------------------------------------------|
+| Chunk-causal Sana DiT (distilled) | `sana_dit/model.pt` |
+| Causal LTX-2 VAE | `ltx2_causal_vae/` |
+| Chunk-causal LTX-2 refiner | `refiner_diffusers/{transformer,connectors}/` |
+| Inference config | `sana_wm_streaming_1600m_720p.yaml` |
 
 The Sana text encoder (`gemma-2-2b-it`) is fetched separately from
 `Efficient-Large-Model/gemma-2-2b-it`.
