@@ -846,18 +846,35 @@ class RefinerChunkRunner:
             fps=self._fps,
         )
         kv_prefix_per_layer: list[dict[str, object]] = []
+        preconcat_prefix = _env_flag("SANA_WM_REFINER_PRECONCAT_PREFIX")
         for layer_idx in range(self._n_layers):
             hk = self._history_kv_post[layer_idx]
-            kv_prefix_per_layer.append(
-                {
-                    "mode": "rf_shifted_sink",
-                    "sink_k_pre": self._sink_kv_pre[layer_idx][0],
-                    "sink_v": self._sink_kv_pre[layer_idx][1],
-                    "sink_pe": sink_pe,
-                    "history_k": (hk[0] if hk is not None else None),
-                    "history_v": (hk[1] if hk is not None else None),
-                }
-            )
+            prefix: dict[str, object] = {
+                "mode": "rf_shifted_sink",
+                "sink_k_pre": self._sink_kv_pre[layer_idx][0],
+                "sink_v": self._sink_kv_pre[layer_idx][1],
+                "sink_pe": sink_pe,
+                "history_k": (hk[0] if hk is not None else None),
+                "history_v": (hk[1] if hk is not None else None),
+            }
+            if preconcat_prefix:
+                prefix_k_parts: list[torch.Tensor] = []
+                prefix_v_parts: list[torch.Tensor] = []
+                sink_k_pre, sink_v = self._sink_kv_pre[layer_idx]
+                if sink_k_pre.shape[1] > 0 and sink_v.shape[1] > 0:
+                    attn = refiner.transformer.transformer_blocks[layer_idx].attn1
+                    sink_k = _apply_refiner_rotary(attn, sink_k_pre.to(self._dtype), sink_pe)
+                    prefix_k_parts.append(sink_k)
+                    prefix_v_parts.append(sink_v.to(self._dtype))
+                if hk is not None and hk[0].shape[1] > 0 and hk[1].shape[1] > 0:
+                    prefix_k_parts.append(hk[0].to(self._dtype))
+                    prefix_v_parts.append(hk[1].to(self._dtype))
+                if prefix_k_parts:
+                    prefix_k = torch.cat(prefix_k_parts, dim=1)
+                    prefix_v = torch.cat(prefix_v_parts, dim=1)
+                    prefix["prefix_k"] = prefix_k
+                    prefix["prefix_v"] = prefix_v
+            kv_prefix_per_layer.append(prefix)
 
         # 3) FM endpoint at sigma=sigma0: single epsilon per block.
         eps = torch.randn(clean_block.shape, generator=self._generator, device=device, dtype=self._dtype)
@@ -1062,7 +1079,6 @@ def _streaming_self_attention(
       ``_kv_cache_capture`` and ``_tf_capture_kv`` hooks record K/V into the
       module for the AR orchestrator to read back.
     """
-    from diffusers.models.attention_dispatch import dispatch_attention_fn
     from diffusers.models.transformers.transformer_ltx2 import apply_interleaved_rotary_emb, apply_split_rotary_emb
 
     gate_logits = attn.to_gate_logits(hidden_states) if attn.to_gate_logits is not None else None
@@ -1099,29 +1115,35 @@ def _streaming_self_attention(
 
     tf_prefix = getattr(attn, "_tf_kv_prefix", None)
     if isinstance(tf_prefix, dict) and tf_prefix.get("mode") == "rf_shifted_sink":
-        prefix_k_parts: list[torch.Tensor] = []
-        prefix_v_parts: list[torch.Tensor] = []
-        sink_k_pre = tf_prefix.get("sink_k_pre")
-        sink_v = tf_prefix.get("sink_v")
-        if sink_k_pre is not None and sink_v is not None and sink_k_pre.shape[1] > 0:
-            sink_pe = tf_prefix.get("sink_pe")
-            if sink_pe is None:
-                raise RuntimeError("rf_shifted_sink prefix requires a sink_pe RoPE tuple.")
-            sink_k_pre_dt = sink_k_pre.to(key.dtype)
-            if attn.rope_type == "interleaved":
-                sink_k = apply_interleaved_rotary_emb(sink_k_pre_dt, sink_pe)
-            else:
-                sink_k = apply_split_rotary_emb(sink_k_pre_dt, sink_pe)
-            prefix_k_parts.append(sink_k)
-            prefix_v_parts.append(sink_v.to(value.dtype))
-        history_k = tf_prefix.get("history_k")
-        history_v = tf_prefix.get("history_v")
-        if history_k is not None and history_v is not None and history_k.shape[1] > 0:
-            prefix_k_parts.append(history_k.to(key.dtype))
-            prefix_v_parts.append(history_v.to(value.dtype))
-        if prefix_k_parts:
-            key = torch.cat([*prefix_k_parts, key], dim=1)
-            value = torch.cat([*prefix_v_parts, value], dim=1)
+        prefix_k = tf_prefix.get("prefix_k")
+        prefix_v = tf_prefix.get("prefix_v")
+        if prefix_k is not None and prefix_v is not None:
+            key = torch.cat([prefix_k.to(key.dtype), key], dim=1)
+            value = torch.cat([prefix_v.to(value.dtype), value], dim=1)
+        else:
+            prefix_k_parts: list[torch.Tensor] = []
+            prefix_v_parts: list[torch.Tensor] = []
+            sink_k_pre = tf_prefix.get("sink_k_pre")
+            sink_v = tf_prefix.get("sink_v")
+            if sink_k_pre is not None and sink_v is not None and sink_k_pre.shape[1] > 0:
+                sink_pe = tf_prefix.get("sink_pe")
+                if sink_pe is None:
+                    raise RuntimeError("rf_shifted_sink prefix requires a sink_pe RoPE tuple.")
+                sink_k_pre_dt = sink_k_pre.to(key.dtype)
+                if attn.rope_type == "interleaved":
+                    sink_k = apply_interleaved_rotary_emb(sink_k_pre_dt, sink_pe)
+                else:
+                    sink_k = apply_split_rotary_emb(sink_k_pre_dt, sink_pe)
+                prefix_k_parts.append(sink_k)
+                prefix_v_parts.append(sink_v.to(value.dtype))
+            history_k = tf_prefix.get("history_k")
+            history_v = tf_prefix.get("history_v")
+            if history_k is not None and history_v is not None and history_k.shape[1] > 0:
+                prefix_k_parts.append(history_k.to(key.dtype))
+                prefix_v_parts.append(history_v.to(value.dtype))
+            if prefix_k_parts:
+                key = torch.cat([*prefix_k_parts, key], dim=1)
+                value = torch.cat([*prefix_v_parts, value], dim=1)
 
     query = query.unflatten(2, (attn.heads, -1))
     key = key.unflatten(2, (attn.heads, -1))
@@ -1135,34 +1157,25 @@ def _streaming_self_attention(
     # injected prefix + current K/V in one SDPA call. Legacy single-shot
     # mode keeps the sink-self / current-cross split.
     if n_context_tokens <= 0 or n_context_tokens >= query.shape[1]:
-        hidden_states = dispatch_attention_fn(
+        hidden_states = _refiner_attention(
             query,
             key,
             value,
-            attn_mask=None,
-            dropout_p=0.0,
-            is_causal=False,
             backend=backend,
             parallel_config=parallel_config,
         )
     else:
-        context_hidden_states = dispatch_attention_fn(
+        context_hidden_states = _refiner_attention(
             query[:, :n_context_tokens],
             key[:, :n_context_tokens],
             value[:, :n_context_tokens],
-            attn_mask=None,
-            dropout_p=0.0,
-            is_causal=False,
             backend=backend,
             parallel_config=parallel_config,
         )
-        current_hidden_states = dispatch_attention_fn(
+        current_hidden_states = _refiner_attention(
             query[:, n_context_tokens:],
             key,
             value,
-            attn_mask=None,
-            dropout_p=0.0,
-            is_causal=False,
             backend=backend,
             parallel_config=parallel_config,
         )
@@ -1179,6 +1192,63 @@ def _streaming_self_attention(
     hidden_states = attn.to_out[0](hidden_states)
     hidden_states = attn.to_out[1](hidden_states)
     return hidden_states
+
+
+def _apply_refiner_rotary(
+    attn: nn.Module,
+    tensor: torch.Tensor,
+    rotary_emb: tuple[torch.Tensor, torch.Tensor],
+) -> torch.Tensor:
+    from diffusers.models.transformers.transformer_ltx2 import apply_interleaved_rotary_emb, apply_split_rotary_emb
+
+    if attn.rope_type == "interleaved":
+        return apply_interleaved_rotary_emb(tensor, rotary_emb)
+    if attn.rope_type == "split":
+        return apply_split_rotary_emb(tensor, rotary_emb)
+    raise ValueError(f"Unsupported LTX-2 RoPE type: {attn.rope_type}")
+
+
+def _refiner_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    backend: object,
+    parallel_config: object,
+) -> torch.Tensor:
+    kernel = _refiner_self_attn_kernel()
+    if kernel in {"flash_attn", "flash-attn", "fa2"}:
+        return _flash_attn_func()(query, key, value, dropout_p=0.0, causal=False)
+    if kernel and kernel not in {"default", "dispatch", "diffusers", "0", "off"}:
+        raise ValueError(f"Unsupported SANA_WM_REFINER_SELF_ATTN_KERNEL={kernel!r}.")
+    from diffusers.models.attention_dispatch import dispatch_attention_fn
+
+    return dispatch_attention_fn(
+        query,
+        key,
+        value,
+        attn_mask=None,
+        dropout_p=0.0,
+        is_causal=False,
+        backend=backend,
+        parallel_config=parallel_config,
+    )
+
+
+def _refiner_self_attn_kernel() -> str:
+    return os.environ.get("SANA_WM_REFINER_SELF_ATTN_KERNEL", "").strip().lower()
+
+
+_FLASH_ATTN_FUNC = None
+
+
+def _flash_attn_func():
+    global _FLASH_ATTN_FUNC
+    if _FLASH_ATTN_FUNC is None:
+        from flash_attn import flash_attn_func
+
+        _FLASH_ATTN_FUNC = flash_attn_func
+    return _FLASH_ATTN_FUNC
 
 
 def _set_cross_attention_kv_cache(

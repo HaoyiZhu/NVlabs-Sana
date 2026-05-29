@@ -389,6 +389,8 @@ def main() -> None:
                 "SANA_WM_STAGE1_KV_SAVE_STRIDE",
                 "SANA_WM_REFINER_NVFP4",
                 "SANA_WM_REFINER_ATTN_BACKEND",
+                "SANA_WM_REFINER_SELF_ATTN_KERNEL",
+                "SANA_WM_REFINER_PRECONCAT_PREFIX",
                 "SANA_WM_REFINER_KV_CACHE_DTYPE",
                 "SANA_WM_REFINER_FAST_KV_CAPTURE",
                 "SANA_WM_REFINER_CROSS_ATTN_KV_CACHE",
