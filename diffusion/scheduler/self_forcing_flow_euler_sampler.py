@@ -526,19 +526,20 @@ class SelfForcingFlowEulerCamCtrl(SelfForcingFlowEuler):
                 if start_f <= frame_idx < end_f:
                     cond_local_indices.append(frame_idx - start_f)
 
-            # Build condition mask for this chunk: 1.0 for conditioned (clean)
-            # frames, 0.0 for noisy frames. Shape (B, C, F_chunk, H, W).
-            condition_mask_chunk = torch.zeros(
-                batch_size,
-                num_latent_channels,
-                chunk_frames,
-                height,
-                width,
-                device=device,
-                dtype=torch.float32,
-            )
-            for loc in cond_local_indices:
-                condition_mask_chunk[:, :, loc] = 1.0
+            # Build a per-frame mask instead of a full (B,C,F,H,W) tensor.
+            # The model consumes frame-level timesteps and the scheduler uses
+            # the same frame value broadcast over spatial tokens.
+            condition_frame_mask = None
+            if cond_local_indices:
+                condition_frame_mask = torch.zeros(
+                    batch_size,
+                    chunk_frames,
+                    device=device,
+                    dtype=torch.float32,
+                )
+                for loc in cond_local_indices:
+                    condition_frame_mask[:, loc] = 1.0
+            spatial_tokens = height * width
 
             for i, t in tqdm(
                 list(enumerate(timesteps)),
@@ -551,23 +552,27 @@ class SelfForcingFlowEulerCamCtrl(SelfForcingFlowEuler):
                     else latents[:, :, start_f:end_f]
                 )
 
-                # Broadcast the device-side timestep instead of materialising
-                # via `.item()` — the latter would D2H-sync and serialise the
-                # host with stage-1's kernels.
-                t_dev = t.to(device=device, dtype=torch.float32).view(1, 1, 1, 1, 1)
-                timestep_tensor = (1.0 - condition_mask_chunk) * t_dev
-
-                if do_classifier_free_guidance:
-                    timestep_tensor_model = torch.cat(
-                        [timestep_tensor, timestep_tensor],
-                        dim=0,
-                    )
+                # Keep the timestep on device without `.item()` syncs, but
+                # avoid materialising a full channel x spatial mask.
+                t_dev = t.to(device=device, dtype=torch.float32).reshape(1)
+                if condition_frame_mask is None:
+                    timestep_frames = t_dev.expand(batch_size, chunk_frames)
+                    per_token_timesteps = t_dev.expand(batch_size, chunk_frames * spatial_tokens)
                 else:
-                    timestep_tensor_model = timestep_tensor
+                    timestep_frames = (1.0 - condition_frame_mask) * t_dev
+                    per_token_timesteps = timestep_frames[:, :, None].expand(
+                        batch_size,
+                        chunk_frames,
+                        spatial_tokens,
+                    ).reshape(batch_size, -1)
+
+                timestep_tensor_model = timestep_frames[:, None, :]
+                if do_classifier_free_guidance:
+                    timestep_tensor_model = torch.cat([timestep_tensor_model, timestep_tensor_model], dim=0)
 
                 noise_pred, _ = self.model(
                     latent_model_input,
-                    timestep_tensor_model[:, :1, :, 0, 0],
+                    timestep_tensor_model,
                     prompt_embeds,
                     start_f=rope_start_f,
                     end_f=rope_end_f,
@@ -604,11 +609,7 @@ class SelfForcingFlowEulerCamCtrl(SelfForcingFlowEuler):
                         num_latent_channels,
                         -1,
                     ).transpose(1, 2),
-                    per_token_timesteps=timestep_tensor.reshape(
-                        batch_size,
-                        num_latent_channels,
-                        -1,
-                    )[:, 0],
+                    per_token_timesteps=per_token_timesteps,
                     return_dict=False,
                 )[0]
                 denoised = denoised.transpose(1, 2).reshape(chunk_shape)
@@ -715,8 +716,11 @@ class SelfForcingFlowEulerCamCtrl(SelfForcingFlowEuler):
 
             # Detect cache layout from type flag (slot 6).
             type_flag = prev_last[_SLOT_TYPE_FLAG] if prev_last[_SLOT_TYPE_FLAG] is not None else None
+            type_flag_value = None
+            if type_flag is not None:
+                type_flag_value = float(type_flag.item()) if isinstance(type_flag, torch.Tensor) else float(type_flag)
 
-            if type_flag is not None and type_flag.item() > 0.5:
+            if type_flag_value is not None and type_flag_value > 0.5:
                 # --- State-based (GDN): last chunk's state is the full history ---
                 # NOTE: ``CachedGLUMBConvTemp`` writes tconv state to
                 # ``kv_cache[-1]`` (slot 9), not ``_SLOT_TCONV`` (slot 5). We
@@ -735,7 +739,7 @@ class SelfForcingFlowEulerCamCtrl(SelfForcingFlowEuler):
                     prev_last[-1],  # FFN tconv state (slot 9)
                 ]
 
-            elif type_flag is not None:
+            elif type_flag_value is not None:
                 # --- Concat-based (Softmax): concatenate K/V across chunks ---
                 acc: list[torch.Tensor | None] = [None] * _NUM_CACHE_SLOTS
 
@@ -749,7 +753,7 @@ class SelfForcingFlowEulerCamCtrl(SelfForcingFlowEuler):
                             continue
                         # Softmax K/V are (B, H, N, D) — concat along dim 2.
                         if acc[s] is None:
-                            acc[s] = prev[s].clone()
+                            acc[s] = prev[s]
                         else:
                             acc[s] = torch.cat([acc[s], prev[s]], dim=2)
 
@@ -789,7 +793,7 @@ class SelfForcingFlowEulerCamCtrl(SelfForcingFlowEuler):
                             cat_dim = -1
 
                         if acc_legacy[s] is None:
-                            acc_legacy[s] = prev[s].clone()
+                            acc_legacy[s] = prev[s]
                         else:
                             acc_legacy[s] = torch.cat([acc_legacy[s], prev[s]], dim=cat_dim)
 

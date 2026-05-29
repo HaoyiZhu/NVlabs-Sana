@@ -26,8 +26,8 @@ needed:
 
     * ``torch.compile`` on the VAE decoder + refiner transformer
       (``max-autotune-no-cudagraphs``, numerically equivalent to eager).
-    * Flash-only SDPA, Inductor ``coordinate_descent_tuning`` + ``epilogue_fusion``,
-      cuDNN benchmark, expandable CUDA allocator.
+    * Fast SDPA backend selection, Inductor ``coordinate_descent_tuning`` +
+      ``epilogue_fusion``, cuDNN benchmark, expandable CUDA allocator.
 
 Reaches ~0.93× of realtime in steady-state on a single H100 after the
 one-time ``torch.compile`` warmup (~3 min cold, ~30 s warm cache).
@@ -36,8 +36,10 @@ one-time ``torch.compile`` warmup (~3 min cold, ~30 s warm cache).
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
+import time
 from pathlib import Path
 
 # Env knobs that must be set before any ``torch`` / ``diffusion.*`` import.
@@ -138,6 +140,22 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="ffmpeg CRF for the progressive MP4 (lower = higher quality).")
     p.add_argument("--streaming_preset", default="medium",
                    help="ffmpeg libx264 preset for the progressive MP4 writer.")
+    p.add_argument("--output_mode", choices=["mp4", "cpu", "discard"], default="mp4",
+                   help="mp4 writes H.264, cpu copies decoded uint8 frames to host without writing, discard decodes on GPU and drops frames after synchronization.")
+    p.add_argument("--no_mp4", action="store_true",
+                   help="Alias for --output_mode=discard; excludes uint8 CPU transfer and MP4 encoding from timings.")
+    p.add_argument("--benchmark_json", type=Path, default=None,
+                   help="Optional JSON file with wall-clock throughput metrics.")
+    p.add_argument("--benchmark_repeats", type=int, default=1,
+                   help="Run generation this many times in one process; useful for warm/steady benchmark separation.")
+    p.add_argument("--profile_cuda", action="store_true",
+                   help="Record per-stage CUDA event timings; useful for bottleneck breakdown but disabled by default for pure throughput.")
+    p.add_argument("--sample_frames_npz", type=Path, default=None,
+                   help="Optional .npz path for sampled decoded uint8 frames in cpu/mp4 mode.")
+    p.add_argument("--sample_frame_stride", type=int, default=16,
+                   help="Save every Nth output frame when --sample_frames_npz is set.")
+    p.add_argument("--no_compile", action="store_true",
+                   help="Disable torch.compile for smoke/debug runs.")
 
     p.add_argument("--offload_vae", action="store_true",
                    help="Move the VAE to CPU between encode/decode steps.")
@@ -167,11 +185,14 @@ def _resolve_streaming_paths(args: argparse.Namespace) -> tuple[Path, Path, Path
 
 
 def _apply_fast_defaults() -> None:
-    """Set the numerically-neutral perf knobs (cuDNN bench, flash SDPA, Inductor)."""
+    """Set numerically-neutral perf knobs (cuDNN bench, SDPA, Inductor)."""
     torch.backends.cudnn.benchmark = True
     torch.set_float32_matmul_precision("high")
     torch.backends.cuda.enable_flash_sdp(True)
-    torch.backends.cuda.enable_math_sdp(False)
+    # Keep math SDP as a fallback for the Gemma text encoder shapes that are
+    # not accepted by flash/cuDNN SDP on GB200. Main video attention still
+    # selects flash/cuDNN where legal.
+    torch.backends.cuda.enable_math_sdp(True)
     torch.backends.cuda.enable_mem_efficient_sdp(False)
     torch.backends.cuda.enable_cudnn_sdp(True)
     import torch._inductor.config as _ic
@@ -181,6 +202,8 @@ def _apply_fast_defaults() -> None:
 
 def main() -> None:
     args = _build_parser().parse_args()
+    if args.benchmark_repeats < 1:
+        raise SystemExit("--benchmark_repeats must be >= 1.")
     logger: logging.Logger = get_root_logger()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _apply_fast_defaults()
@@ -237,19 +260,20 @@ def main() -> None:
         logger=logger,
     )
 
-    # Numerically-equivalent compile (default Inductor mode, no CUDA-graph
-    # capture, no fp32->fp16 substitution). Cold compile takes ~3 min the
-    # first time; subsequent runs reuse the Inductor cache.
-    logger.info(
-        "[streaming] torch.compile(vae.decoder + refiner.transformer, "
-        "mode='max-autotune-no-cudagraphs')"
-    )
-    pipeline.vae.decoder = torch.compile(
-        pipeline.vae.decoder, mode="max-autotune-no-cudagraphs", dynamic=True
-    )
-    pipeline.refiner.transformer = torch.compile(
-        pipeline.refiner.transformer, mode="max-autotune-no-cudagraphs", dynamic=True
-    )
+    if not args.no_compile:
+        # Numerically-equivalent compile (default Inductor mode, no CUDA-graph
+        # capture, no fp32->fp16 substitution). Cold compile takes ~3 min the
+        # first time; subsequent runs reuse the Inductor cache.
+        logger.info(
+            "[streaming] torch.compile(vae.decoder + refiner.transformer, "
+            "mode='max-autotune-no-cudagraphs')"
+        )
+        pipeline.vae.decoder = torch.compile(
+            pipeline.vae.decoder, mode="max-autotune-no-cudagraphs", dynamic=True
+        )
+        pipeline.refiner.transformer = torch.compile(
+            pipeline.refiner.transformer, mode="max-autotune-no-cudagraphs", dynamic=True
+        )
 
     denoising_step_list = [int(t.strip()) for t in args.denoising_step_list.split(",") if t.strip()]
     if not denoising_step_list or denoising_step_list[-1] != 0:
@@ -271,21 +295,150 @@ def main() -> None:
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    streaming_path = out_dir / f"{args.name}_streaming.mp4"
-    logger.info(f"[streaming] starting interactive chunk-pipelined inference -> {streaming_path}")
-    result = pipeline.generate_streaming(
-        cropped,
-        prompt,
-        c2w,
-        intrinsics_vec4,
-        params,
-        output_path=streaming_path,
-        streaming_crf=args.streaming_crf,
-        streaming_preset=args.streaming_preset,
-    )
-    logger.info(
-        f"[streaming] done: wrote {result['n_pixel_frames']} frames to {result['output_path']}"
-    )
+    if args.no_mp4 and args.output_mode not in {"mp4", "discard"}:
+        raise SystemExit("--no_mp4 cannot be combined with --output_mode=cpu.")
+    output_mode = "discard" if args.no_mp4 else args.output_mode
+    if args.sample_frames_npz is not None and output_mode == "discard":
+        raise SystemExit("--sample_frames_npz requires --output_mode=cpu or --output_mode=mp4.")
+    if args.sample_frames_npz is not None and args.sample_frame_stride < 1:
+        raise SystemExit("--sample_frame_stride must be >= 1.")
+
+    run_payloads = []
+    result = None
+    end_to_end_seconds = 0.0
+    for run_idx in range(args.benchmark_repeats):
+        suffix = "" if args.benchmark_repeats == 1 else f"_run{run_idx:02d}"
+        streaming_path = out_dir / f"{args.name}{suffix}_streaming.mp4"
+        sample_frames_path = None
+        if args.sample_frames_npz is not None:
+            sample_frames_path = args.sample_frames_npz
+            if args.benchmark_repeats > 1:
+                sample_frames_path = sample_frames_path.with_name(
+                    f"{sample_frames_path.stem}{suffix}{sample_frames_path.suffix}"
+                )
+        logger.info(
+            f"[streaming] starting interactive chunk-pipelined inference "
+            f"run={run_idx}/{args.benchmark_repeats - 1} "
+            f"output_mode={output_mode} -> {streaming_path}"
+        )
+        wall_start = time.perf_counter()
+        result = pipeline.generate_streaming(
+            cropped,
+            prompt,
+            c2w,
+            intrinsics_vec4,
+            params,
+            output_path=streaming_path,
+            streaming_crf=args.streaming_crf,
+            streaming_preset=args.streaming_preset,
+            output_mode=output_mode,
+            profile_cuda=args.profile_cuda,
+            sample_frames_path=sample_frames_path,
+            sample_frame_stride=args.sample_frame_stride,
+        )
+        end_to_end_seconds = time.perf_counter() - wall_start
+        logger.info(
+            f"[streaming] done: run={run_idx} mode={result['output_mode']} "
+            f"frames={result['n_pixel_frames']} stream_wall={result['wall_seconds']:.3f}s "
+            f"e2e={end_to_end_seconds:.3f}s fps={result['frames_per_second']:.3f} "
+            f"realtime={result['realtime_factor']:.3f}x path={result['output_path']}"
+        )
+        run_payloads.append(
+            {
+                "run_index": int(run_idx),
+                "output_mode": result["output_mode"],
+                "output_path": str(result["output_path"]) if result["output_path"] is not None else None,
+                "n_pixel_frames": int(result["n_pixel_frames"]),
+                "frames_per_second": float(result["frames_per_second"]),
+                "realtime_factor": float(result["realtime_factor"]),
+                "stream_wall_seconds": float(result["wall_seconds"]),
+                "end_to_end_seconds": float(end_to_end_seconds),
+                "first_chunk_seconds": result["first_chunk_seconds"],
+                "first_chunk_frames": result["first_chunk_frames"],
+                "steady_state_seconds": result["steady_state_seconds"],
+                "steady_state_frames_per_second": result["steady_state_frames_per_second"],
+                "steady_state_realtime_factor": result["steady_state_realtime_factor"],
+                "stage1_cuda_seconds": result["stage1_cuda_seconds"],
+                "refiner_cuda_seconds": result["refiner_cuda_seconds"],
+                "decode_cuda_seconds": result["decode_cuda_seconds"],
+                "sample_frames_path": (
+                    str(result["sample_frames_path"]) if result["sample_frames_path"] is not None else None
+                ),
+                "sampled_frame_count": int(result["sampled_frame_count"]),
+                "sampled_frame_indices": result["sampled_frame_indices"],
+            }
+        )
+
+    assert result is not None
+    if args.benchmark_json is not None:
+        runtime_env = {
+            name: os.environ.get(name)
+            for name in (
+                "CUDA_VISIBLE_DEVICES",
+                "DPM_TQDM",
+                "FUSED_GDN_PRECISION",
+                "PRECISION_OVERRIDE",
+                "PYTORCH_CUDA_ALLOC_CONF",
+            )
+            if os.environ.get(name) is not None
+        }
+        payload = {
+            "output_mode": result["output_mode"],
+            "output_path": str(result["output_path"]) if result["output_path"] is not None else None,
+            "num_frames": int(num_frames),
+            "requested_num_frames": int(args.num_frames),
+            "actual_num_frames": int(num_frames),
+            "n_pixel_frames": int(result["n_pixel_frames"]),
+            "fps_target": int(args.fps),
+            "frames_per_second": float(result["frames_per_second"]),
+            "realtime_factor": float(result["realtime_factor"]),
+            "stream_wall_seconds": float(result["wall_seconds"]),
+            "end_to_end_seconds": float(end_to_end_seconds),
+            "first_chunk_seconds": result["first_chunk_seconds"],
+            "first_chunk_frames": result["first_chunk_frames"],
+            "steady_state_seconds": result["steady_state_seconds"],
+            "steady_state_frames_per_second": result["steady_state_frames_per_second"],
+            "steady_state_realtime_factor": result["steady_state_realtime_factor"],
+            "stage1_cuda_seconds": result["stage1_cuda_seconds"],
+            "refiner_cuda_seconds": result["refiner_cuda_seconds"],
+            "decode_cuda_seconds": result["decode_cuda_seconds"],
+            "sample_frames_path": str(result["sample_frames_path"]) if result["sample_frames_path"] is not None else None,
+            "sampled_frame_count": int(result["sampled_frame_count"]),
+            "sampled_frame_indices": result["sampled_frame_indices"],
+            "n_refiner_blocks": int(result["n_refiner_blocks"]),
+            "n_decode_chunks": int(result["n_decode_chunks"]),
+            "denoising_step_list": denoising_step_list,
+            "num_frame_per_block": int(args.num_frame_per_block),
+            "refiner_block_size": int(args.refiner_block_size),
+            "refiner_kv_max_frames": int(args.refiner_kv_max_frames),
+            "num_cached_blocks": int(args.num_cached_blocks),
+            "torch_compile": not bool(args.no_compile),
+            "profile_cuda": bool(args.profile_cuda),
+            "streaming_root": str(args.streaming_root),
+            "config": str(config_path),
+            "model_path": str(model_path),
+            "causal_vae_path": str(causal_vae_path),
+            "refiner_root": str(refiner_root),
+            "refiner_gemma_root": str(gemma_root),
+            "benchmark_repeats": int(args.benchmark_repeats),
+            "runtime_env": runtime_env,
+            "runs": run_payloads,
+            "best_stream_wall_seconds": min(run["stream_wall_seconds"] for run in run_payloads),
+            "best_realtime_factor": max(run["realtime_factor"] for run in run_payloads),
+            "best_steady_state_realtime_factor": max(
+                (
+                    run["steady_state_realtime_factor"]
+                    for run in run_payloads
+                    if run["steady_state_realtime_factor"] is not None
+                ),
+                default=None,
+            ),
+            "last_stream_wall_seconds": float(run_payloads[-1]["stream_wall_seconds"]),
+            "last_realtime_factor": float(run_payloads[-1]["realtime_factor"]),
+            "last_steady_state_realtime_factor": run_payloads[-1]["steady_state_realtime_factor"],
+        }
+        args.benchmark_json.parent.mkdir(parents=True, exist_ok=True)
+        args.benchmark_json.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
 if __name__ == "__main__":

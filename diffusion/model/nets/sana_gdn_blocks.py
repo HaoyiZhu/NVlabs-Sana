@@ -1326,7 +1326,7 @@ class CachedChunkCausalSoftmaxAttn(ChunkCausalSoftmaxAttn):
         if save_kv_cache:
             kv_cache[_SLOT_FWD_KV] = k.detach().clone()
             kv_cache[_SLOT_FWD_Z] = v.detach().clone()
-            kv_cache[_SLOT_TYPE_FLAG] = torch.tensor([_TYPE_CONCAT], device=x.device)
+            kv_cache[_SLOT_TYPE_FLAG] = _TYPE_CONCAT
         if cached_k is not None:
             k = torch.cat([cached_k.to(k.dtype), k], dim=2)
             v = torch.cat([cached_v.to(v.dtype), v], dim=2)

@@ -274,6 +274,7 @@ class DiffusersLTX2Refiner(nn.Module):
         prompt_attention_mask: torch.Tensor,
         fps: float,
         kv_prefix_per_layer: list[dict[str, object]] | None,
+        active_video_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Forward through the transformer on the ACTIVE BLOCK ONLY and return x0.
 
@@ -293,15 +294,17 @@ class DiffusersLTX2Refiner(nn.Module):
             (batch_size, seq_len), timestep_scalar, dtype=torch.float32, device=self.device
         )
 
-        video_rotary_emb = _build_rotary_emb_for_absolute_positions(
-            transformer=self.transformer,
-            batch_size=batch_size,
-            frame_positions=active_positions,
-            height=int(active.shape[3]),
-            width=int(active.shape[4]),
-            device=self.device,
-            fps=float(fps),
-        )
+        video_rotary_emb = active_video_rotary_emb
+        if video_rotary_emb is None:
+            video_rotary_emb = _build_rotary_emb_for_absolute_positions(
+                transformer=self.transformer,
+                batch_size=batch_size,
+                frame_positions=active_positions,
+                height=int(active.shape[3]),
+                width=int(active.shape[4]),
+                device=self.device,
+                fps=float(fps),
+            )
         # Replace the per-frame uniform-σ adaLN time embedding with the active
         # block's mean sigma (= sigma_cur here), mirroring tian's prompt_sigma
         # `mean_active` mode.
@@ -629,7 +632,9 @@ class RefinerChunkRunner:
         self._prompt_attention_mask = prompt_attention_mask
         self._fps = float(fps)
         self._sigmas = sigmas
-        self._sigma_max = float(sigmas[0])
+        self._sigma_values = [float(v) for v in sigmas.detach().float().cpu()]
+        self._sigma_pairs = list(zip(self._sigma_values[:-1], self._sigma_values[1:]))
+        self._sigma_max = self._sigma_values[0]
         self._n_steps = int(sigmas.numel() - 1)
         self._source_sink_frames = int(source_sink_frames)
         self._block_size = int(block_size)
@@ -753,9 +758,16 @@ class RefinerChunkRunner:
         x_t = ((1.0 - self._sigma_max) * clean_block.float() + self._sigma_max * eps.float()).to(self._dtype)
 
         active_positions = list(range(int(block_start), int(block_end)))
-        for level in range(self._n_steps):
-            sigma_cur = float(self._sigmas[level].item())
-            sigma_next = float(self._sigmas[level + 1].item())
+        active_video_rotary_emb = _build_rotary_emb_for_absolute_positions(
+            transformer=refiner.transformer,
+            batch_size=B,
+            frame_positions=active_positions,
+            height=self._H,
+            width=self._W,
+            device=device,
+            fps=self._fps,
+        )
+        for sigma_cur, sigma_next in self._sigma_pairs:
             pred_x0 = refiner._predict_x0_active_block(
                 active=x_t,
                 active_positions=active_positions,
@@ -764,6 +776,7 @@ class RefinerChunkRunner:
                 prompt_attention_mask=self._prompt_attention_mask,
                 fps=self._fps,
                 kv_prefix_per_layer=kv_prefix_per_layer,
+                active_video_rotary_emb=active_video_rotary_emb,
             )
             if sigma_cur <= 1.0e-6:
                 x_t = pred_x0.to(self._dtype)

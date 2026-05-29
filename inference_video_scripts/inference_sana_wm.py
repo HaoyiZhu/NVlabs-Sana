@@ -976,6 +976,10 @@ class SanaWMPipeline:
         output_path: str | Path,
         streaming_crf: int = 18,
         streaming_preset: str = "medium",
+        output_mode: str = "mp4",
+        profile_cuda: bool = False,
+        sample_frames_path: str | Path | None = None,
+        sample_frame_stride: int = 0,
     ) -> dict[str, object]:
         """Chunk-pipelined interactive generation.
 
@@ -1143,6 +1147,10 @@ class SanaWMPipeline:
             mp4_crf=int(streaming_crf),
             mp4_preset=str(streaming_preset),
             drop_first_pixel=True,
+            output_mode=output_mode,
+            profile_cuda=bool(profile_cuda),
+            sample_frames_path=sample_frames_path,
+            sample_frame_stride=int(sample_frame_stride),
         )
         result = run_streaming_inference(
             stage1_chunk_iter=stage1_iter,
@@ -1159,6 +1167,23 @@ class SanaWMPipeline:
         return {
             "output_path": result.output_path,
             "n_pixel_frames": result.n_pixel_frames,
+            "n_refiner_blocks": result.n_refiner_blocks,
+            "n_decode_chunks": result.n_decode_chunks,
+            "output_mode": result.output_mode,
+            "wall_seconds": result.wall_seconds,
+            "first_chunk_seconds": result.first_chunk_seconds,
+            "first_chunk_frames": result.first_chunk_frames,
+            "steady_state_seconds": result.steady_state_seconds,
+            "steady_state_frames_per_second": result.steady_state_frames_per_second,
+            "steady_state_realtime_factor": result.steady_state_realtime_factor,
+            "frames_per_second": result.frames_per_second,
+            "realtime_factor": result.realtime_factor,
+            "stage1_cuda_seconds": result.stage1_cuda_seconds,
+            "refiner_cuda_seconds": result.refiner_cuda_seconds,
+            "decode_cuda_seconds": result.decode_cuda_seconds,
+            "sample_frames_path": result.sample_frames_path,
+            "sampled_frame_count": result.sampled_frame_count,
+            "sampled_frame_indices": result.sampled_frame_indices,
             "c2w": c2w[1 : 1 + result.n_pixel_frames],
         }
 
