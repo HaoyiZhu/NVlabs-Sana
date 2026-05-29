@@ -401,6 +401,7 @@ def main() -> None:
                 "SANA_WM_REFINER_NVFP4_OFFLOAD_VAE",
                 "SANA_WM_TE_NVFP4_CPU_STAGING",
                 "SANA_WM_STREAMING_LAZY_VAE_DECODER",
+                "SANA_WM_STREAMING_EARLY_DECODE",
             )
             if os.environ.get(name) is not None
         }
