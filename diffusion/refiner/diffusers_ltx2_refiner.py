@@ -37,6 +37,7 @@ from pathlib import Path
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 STAGE_2_DISTILLED_SIGMA_VALUES: tuple[float, ...] = (0.909375, 0.725, 0.421875, 0.0)
 
@@ -358,7 +359,8 @@ class DiffusersLTX2Refiner(nn.Module):
         fps: float,
         kv_prefix_per_layer: list[dict[str, object]] | None,
         active_video_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
-    ) -> torch.Tensor:
+        capture_post_kv: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
         """Forward through the transformer on the ACTIVE BLOCK ONLY and return x0.
 
         The active block's Q attends to ``[prefix, current]`` K/V via the
@@ -392,6 +394,8 @@ class DiffusersLTX2Refiner(nn.Module):
         # block's mean sigma (= sigma_cur here), mirroring tian's prompt_sigma
         # `mean_active` mode.
         _set_kv_prefix_on_blocks(self.transformer, kv_prefix_per_layer)
+        if capture_post_kv:
+            _set_capture_flag_on_blocks(self.transformer, "post_rope", enable=True)
         try:
             velocity = self._forward_video_only_with_rope(
                 hidden_states=latent_tokens,
@@ -402,14 +406,17 @@ class DiffusersLTX2Refiner(nn.Module):
                 n_context_tokens=0,
             )
         finally:
+            if capture_post_kv:
+                _set_capture_flag_on_blocks(self.transformer, "post_rope", enable=False)
             _clear_kv_prefix_on_blocks(self.transformer)
+        captured_kv = _collect_captured_kv_from_blocks(self.transformer, "post_rope") if capture_post_kv else None
 
         # FM x0 prediction: x_t - σ_cur · v.
         raw_sigma = torch.full(
             (batch_size, seq_len, 1), float(sigma_cur), dtype=torch.float32, device=self.device
         )
         denoised_tokens = latent_tokens.float() - velocity.float() * raw_sigma
-        return _unpack_latents(
+        denoised = _unpack_latents(
             denoised_tokens.to(self.dtype),
             num_frames=int(active.shape[2]),
             height=int(active.shape[3]),
@@ -417,6 +424,9 @@ class DiffusersLTX2Refiner(nn.Module):
             patch_size=self.transformer.config.patch_size,
             patch_size_t=self.transformer.config.patch_size_t,
         )
+        if captured_kv is not None:
+            return denoised, captured_kv
+        return denoised
 
     @torch.inference_mode()
     def _capture_block_kv(
@@ -593,8 +603,11 @@ class DiffusersLTX2Refiner(nn.Module):
         temb = temb.view(batch_size, -1, temb.size(-1))
         embedded_timestep = embedded_timestep.view(batch_size, -1, embedded_timestep.size(-1))
 
-        encoder_hidden_states = transformer.caption_projection(encoder_hidden_states)
-        encoder_hidden_states = encoder_hidden_states.view(batch_size, -1, hidden_states.size(-1))
+        if _has_cross_attention_kv_cache(transformer):
+            encoder_hidden_states = None
+        else:
+            encoder_hidden_states = transformer.caption_projection(encoder_hidden_states)
+            encoder_hidden_states = encoder_hidden_states.view(batch_size, -1, hidden_states.size(-1))
 
         with self._attention_backend_context(), self._nvfp4_autocast():
             for block in transformer.transformer_blocks:
@@ -646,8 +659,11 @@ class DiffusersLTX2Refiner(nn.Module):
         temb = temb.view(batch_size, -1, temb.size(-1))
         embedded_timestep = embedded_timestep.view(batch_size, -1, embedded_timestep.size(-1))
 
-        encoder_hidden_states = transformer.caption_projection(encoder_hidden_states)
-        encoder_hidden_states = encoder_hidden_states.view(batch_size, -1, hidden_states.size(-1))
+        if _has_cross_attention_kv_cache(transformer):
+            encoder_hidden_states = None
+        else:
+            encoder_hidden_states = transformer.caption_projection(encoder_hidden_states)
+            encoder_hidden_states = encoder_hidden_states.view(batch_size, -1, hidden_states.size(-1))
 
         with self._attention_backend_context(), self._nvfp4_autocast():
             for block in transformer.transformer_blocks:
@@ -735,6 +751,11 @@ class RefinerChunkRunner:
             * int(W // transformer.config.patch_size)
             * int(transformer.config.patch_size_t)
         )
+        if _env_flag("SANA_WM_REFINER_CROSS_ATTN_KV_CACHE"):
+            with refiner._nvfp4_autocast():
+                _set_cross_attention_kv_cache(refiner.transformer, prompt_embeds, prompt_attention_mask)
+        else:
+            _clear_cross_attention_kv_cache(refiner.transformer)
 
         self._sink_kv_pre: list[tuple[torch.Tensor, torch.Tensor]] | None = None
         self._history_kv_post: list[tuple[torch.Tensor, torch.Tensor] | None] = [None] * self._n_layers
@@ -852,8 +873,12 @@ class RefinerChunkRunner:
             device=device,
             fps=self._fps,
         )
-        for sigma_cur, sigma_next in self._sigma_pairs:
-            pred_x0 = refiner._predict_x0_active_block(
+        fast_kv_capture = _refiner_fast_kv_capture_mode()
+        reuse_final_predict_kv = fast_kv_capture == "last_predict"
+        captured_kv_post: list[tuple[torch.Tensor, torch.Tensor]] | None = None
+        n_sigma_pairs = len(self._sigma_pairs)
+        for step_idx, (sigma_cur, sigma_next) in enumerate(self._sigma_pairs):
+            pred_result = refiner._predict_x0_active_block(
                 active=x_t,
                 active_positions=active_positions,
                 sigma_cur=sigma_cur,
@@ -862,7 +887,12 @@ class RefinerChunkRunner:
                 fps=self._fps,
                 kv_prefix_per_layer=kv_prefix_per_layer,
                 active_video_rotary_emb=active_video_rotary_emb,
+                capture_post_kv=bool(reuse_final_predict_kv and step_idx == n_sigma_pairs - 1),
             )
+            if isinstance(pred_result, tuple):
+                pred_x0, captured_kv_post = pred_result
+            else:
+                pred_x0 = pred_result
             if sigma_cur <= 1.0e-6:
                 x_t = pred_x0.to(self._dtype)
             else:
@@ -870,15 +900,20 @@ class RefinerChunkRunner:
                 x_t = (ratio * x_t.float() + (1.0 - ratio) * pred_x0.float()).to(self._dtype)
 
         # 4) Capture POST-RoPE K/V for this refined block under the same prefix.
-        block_kv_post = refiner._capture_block_kv(
-            clean_block=x_t,
-            frame_positions=active_positions,
-            prompt_embeds=self._prompt_embeds,
-            prompt_attention_mask=self._prompt_attention_mask,
-            fps=self._fps,
-            capture_mode="post_rope",
-            kv_prefix_per_layer=kv_prefix_per_layer,
-        )
+        if reuse_final_predict_kv:
+            if captured_kv_post is None:
+                raise RuntimeError("SANA_WM_REFINER_FAST_KV_CAPTURE=last_predict did not capture post-RoPE K/V.")
+            block_kv_post = captured_kv_post
+        else:
+            block_kv_post = refiner._capture_block_kv(
+                clean_block=x_t,
+                frame_positions=active_positions,
+                prompt_embeds=self._prompt_embeds,
+                prompt_attention_mask=self._prompt_attention_mask,
+                fps=self._fps,
+                capture_mode="post_rope",
+                kv_prefix_per_layer=kv_prefix_per_layer,
+            )
         for layer_idx in range(self._n_layers):
             new_k, new_v = block_kv_post[layer_idx]
             new_k = _store_kv_tensor(new_k, self._kv_cache_storage_dtype)
@@ -963,7 +998,7 @@ def _forward_video_block(
     *,
     block: nn.Module,
     hidden_states: torch.Tensor,
-    encoder_hidden_states: torch.Tensor,
+    encoder_hidden_states: torch.Tensor | None,
     temb: torch.Tensor,
     video_rotary_emb: tuple[torch.Tensor, torch.Tensor],
     encoder_attention_mask: torch.Tensor | None,
@@ -988,12 +1023,16 @@ def _forward_video_block(
     hidden_states = hidden_states + attn_hidden_states * gate_msa
 
     norm_hidden_states = block.norm2(hidden_states)
-    attn_hidden_states = block.attn2(
-        norm_hidden_states,
-        encoder_hidden_states=encoder_hidden_states,
-        query_rotary_emb=None,
-        attention_mask=encoder_attention_mask,
-    )
+    cross_kv_cache = getattr(block.attn2, "_sana_cross_attn_kv_cache", None)
+    if cross_kv_cache is None:
+        attn_hidden_states = block.attn2(
+            norm_hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            query_rotary_emb=None,
+            attention_mask=encoder_attention_mask,
+        )
+    else:
+        attn_hidden_states = _cross_attention_with_cached_kv(block.attn2, norm_hidden_states, cross_kv_cache)
     hidden_states = hidden_states + attn_hidden_states
 
     norm_hidden_states = block.norm3(hidden_states) * (1 + scale_mlp) + shift_mlp
@@ -1142,6 +1181,116 @@ def _streaming_self_attention(
     return hidden_states
 
 
+def _set_cross_attention_kv_cache(
+    transformer: nn.Module,
+    prompt_embeds: torch.Tensor,
+    prompt_attention_mask: torch.Tensor | None,
+) -> None:
+    blocks = transformer.transformer_blocks
+    if not blocks:
+        return
+    batch_size = int(prompt_embeds.shape[0])
+    hidden_dim = int(blocks[0].attn2.to_k.in_features)
+    encoder_hidden_states = transformer.caption_projection(prompt_embeds)
+    encoder_hidden_states = encoder_hidden_states.view(batch_size, -1, hidden_dim)
+    encoder_attention_mask = _prepare_encoder_attention_mask(prompt_attention_mask, encoder_hidden_states.dtype)
+
+    for block in blocks:
+        attn = block.attn2
+        cross_hidden = encoder_hidden_states
+        if getattr(attn, "norm_cross", False):
+            cross_hidden = attn.norm_encoder_hidden_states(cross_hidden)
+
+        key = attn.to_k(cross_hidden)
+        value = attn.to_v(cross_hidden)
+        if attn.norm_k is not None:
+            key = attn.norm_k(key)
+        inner_dim = int(key.shape[-1])
+        head_dim = inner_dim // int(attn.heads)
+        key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        attn._sana_cross_attn_kv_cache = (key.detach(), value.detach(), encoder_attention_mask)
+
+
+def _clear_cross_attention_kv_cache(transformer: nn.Module) -> None:
+    for block in transformer.transformer_blocks:
+        if hasattr(block.attn2, "_sana_cross_attn_kv_cache"):
+            block.attn2._sana_cross_attn_kv_cache = None
+
+
+def _has_cross_attention_kv_cache(transformer: nn.Module) -> bool:
+    blocks = getattr(transformer, "transformer_blocks", None)
+    if not blocks:
+        return False
+    return getattr(blocks[0].attn2, "_sana_cross_attn_kv_cache", None) is not None
+
+
+def _cross_attention_with_cached_kv(
+    attn: nn.Module,
+    hidden_states: torch.Tensor,
+    cache: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None],
+) -> torch.Tensor:
+    key, value, attention_mask = cache
+    residual = hidden_states
+    input_ndim = hidden_states.ndim
+
+    spatial_norm = getattr(attn, "spatial_norm", None)
+    if spatial_norm is not None:
+        hidden_states = spatial_norm(hidden_states, None)
+
+    if input_ndim == 4:
+        batch_size, channel, height, width = hidden_states.shape
+        hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
+    else:
+        batch_size = int(hidden_states.shape[0])
+        channel = height = width = None
+
+    if attention_mask is not None:
+        source_length = int(key.shape[2])
+        prepare_attention_mask = getattr(attn, "prepare_attention_mask", None)
+        if prepare_attention_mask is not None:
+            attn_mask = prepare_attention_mask(attention_mask, source_length, batch_size)
+            attn_mask = attn_mask.view(batch_size, attn.heads, -1, attn_mask.shape[-1])
+        elif attention_mask.ndim == 3:
+            attn_mask = attention_mask[:, None, :, :]
+        elif attention_mask.ndim == 2:
+            attn_mask = attention_mask[:, None, None, :]
+        else:
+            attn_mask = attention_mask
+    else:
+        attn_mask = None
+
+    group_norm = getattr(attn, "group_norm", None)
+    if group_norm is not None:
+        hidden_states = group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
+
+    query = attn.to_q(hidden_states)
+    if attn.norm_q is not None:
+        query = attn.norm_q(query)
+    head_dim = int(key.shape[-1])
+    query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+
+    hidden_states = F.scaled_dot_product_attention(
+        query,
+        key.to(query.dtype),
+        value.to(query.dtype),
+        attn_mask=attn_mask,
+        dropout_p=0.0,
+        is_causal=False,
+    )
+    hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
+    hidden_states = hidden_states.to(query.dtype)
+    hidden_states = attn.to_out[0](hidden_states)
+    hidden_states = attn.to_out[1](hidden_states)
+
+    if input_ndim == 4:
+        hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
+
+    if getattr(attn, "residual_connection", False):
+        hidden_states = hidden_states + residual
+    return hidden_states / float(getattr(attn, "rescale_output_factor", 1.0))
+
+
 def _set_kv_prefix_on_blocks(
     transformer: nn.Module,
     kv_prefix_per_layer: list[dict[str, object]] | None,
@@ -1288,6 +1437,16 @@ def _resolve_kv_cache_storage_dtype() -> torch.dtype | None:
     if raw in {"fp8_e5m2", "float8_e5m2", "e5m2"}:
         return torch.float8_e5m2
     raise ValueError(f"Unsupported SANA_WM_REFINER_KV_CACHE_DTYPE={raw!r}.")
+
+
+def _refiner_fast_kv_capture_mode() -> str:
+    raw = os.environ.get("SANA_WM_REFINER_FAST_KV_CAPTURE", "").strip().lower()
+    if not raw or raw in {"clean", "exact", "off", "0"}:
+        return "clean"
+    # Reuses K/V from the final denoise prediction, so history is approximate.
+    if raw in {"last_predict", "reuse_last_predict", "final_predict"}:
+        return "last_predict"
+    raise ValueError(f"Unsupported SANA_WM_REFINER_FAST_KV_CAPTURE={raw!r}.")
 
 
 def _store_kv_tensor(tensor: torch.Tensor, dtype: torch.dtype | None) -> torch.Tensor:

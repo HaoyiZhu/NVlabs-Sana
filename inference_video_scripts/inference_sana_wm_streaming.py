@@ -390,6 +390,8 @@ def main() -> None:
                 "SANA_WM_REFINER_NVFP4",
                 "SANA_WM_REFINER_ATTN_BACKEND",
                 "SANA_WM_REFINER_KV_CACHE_DTYPE",
+                "SANA_WM_REFINER_FAST_KV_CAPTURE",
+                "SANA_WM_REFINER_CROSS_ATTN_KV_CACHE",
                 "SANA_WM_STREAMING_LAZY_VAE_DECODER",
             )
             if os.environ.get(name) is not None
