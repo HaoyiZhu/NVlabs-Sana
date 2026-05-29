@@ -920,7 +920,7 @@ class RefinerChunkRunner:
             pred_x0 = None
 
         # 4) Capture POST-RoPE K/V for this refined block under the same prefix.
-        if device.type == "cuda" and not _env_flag("SANA_WM_REFINER_SKIP_EMPTY_CACHE_BEFORE_CAPTURE"):
+        if device.type == "cuda":
             torch.cuda.empty_cache()
         block_kv_post = refiner._capture_block_kv(
             clean_block=x_t,
