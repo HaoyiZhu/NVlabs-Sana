@@ -52,6 +52,7 @@ class StreamingPipelineConfig:
     lazy_vae_decoder: bool = False
     sequential_offload: bool = False
     stage1_done_callback: Callable[[], None] | None = None
+    stage1_chunk_ends: tuple[int, ...] | None = None
 
 
 @dataclass
@@ -129,6 +130,31 @@ def run_streaming_inference(
     if n_stage1_chunks <= 0:
         raise ValueError("n_stage1_chunks must be > 0.")
     n_decode = n_refiner
+    stage1_chunk_ends = tuple(int(v) for v in config.stage1_chunk_ends or ())
+    if stage1_chunk_ends:
+        if len(stage1_chunk_ends) != n_stage1_chunks:
+            raise ValueError(
+                f"stage1_chunk_ends has {len(stage1_chunk_ends)} entries, "
+                f"but n_stage1_chunks={n_stage1_chunks}."
+            )
+    elif n_stage1_chunks == n_refiner:
+        stage1_chunk_ends = tuple(sink_size + (i + 1) * block_size for i in range(n_stage1_chunks))
+    else:
+        raise ValueError("stage1_chunk_ends is required when refiner block size differs from stage-1 chunking.")
+
+    refiner_ready_stage_idx: list[int] = []
+    next_stage_idx = 0
+    for k_ref in range(n_refiner):
+        block_end = sink_size + (k_ref + 1) * block_size
+        while next_stage_idx < len(stage1_chunk_ends) and stage1_chunk_ends[next_stage_idx] < block_end:
+            next_stage_idx += 1
+        if next_stage_idx >= len(stage1_chunk_ends):
+            raise ValueError(
+                f"Refiner block {k_ref} ends at latent frame {block_end}, "
+                "but no Stage-1 chunk produces that frame."
+            )
+        refiner_ready_stage_idx.append(next_stage_idx)
+
     output_mode = str(config.output_mode)
     if output_mode not in {"mp4", "cpu", "discard"}:
         raise ValueError(f"output_mode must be one of mp4/cpu/discard; got {output_mode!r}.")
@@ -236,9 +262,11 @@ def run_streaming_inference(
         #   t=1:  stage1[1], refiner[0]
         #   t=2:  stage1[2], refiner[1], decode[0]
         #   ...
-        n_iters = max(n_stage1_chunks, n_refiner + 1, n_decode + 2)
+        t = 0
+        next_ref = 0
+        next_dec = 0
 
-        for t in range(n_iters):
+        while t < n_stage1_chunks or next_ref < n_refiner or next_dec < n_decode:
             # --- stage-1 chunk t ---
             if t < n_stage1_chunks:
                 with _on(stage1_stream):
@@ -253,9 +281,10 @@ def run_streaming_inference(
                 _record(stage1_events[t], stage1_stream)
 
             # --- refiner block t - 1 ---
-            k_ref = t - 1
-            if 0 <= k_ref < n_refiner:
-                _wait(refiner_stream, stage1_events[k_ref])
+            refiner_launched_before = next_ref
+            if next_ref < n_refiner and refiner_ready_stage_idx[next_ref] <= min(t, n_stage1_chunks - 1):
+                k_ref = next_ref
+                _wait(refiner_stream, stage1_events[refiner_ready_stage_idx[k_ref]])
                 block_start = sink_size + k_ref * block_size
                 block_end = block_start + block_size
                 with _on(refiner_stream):
@@ -276,10 +305,11 @@ def run_streaming_inference(
                     if timing_start is not None and timing_end is not None:
                         refiner_timing_events.append((timing_start, timing_end))
                 _record(refiner_events[k_ref], refiner_stream)
+                next_ref += 1
 
             # --- decode chunk t - 2 ---
-            k_dec = t - 2
-            if 0 <= k_dec < n_decode:
+            if next_dec < n_decode and next_dec < refiner_launched_before:
+                k_dec = next_dec
                 _wait(decode_stream, refiner_events[k_dec])
                 if k_dec == 0:
                     z_slice = refined_full[:, :, : sink_size + block_size]
@@ -313,6 +343,7 @@ def run_streaming_inference(
                         decode_timing_events.append((timing_start, timing_end))
                 _record(decode_events[k_dec], decode_stream)
                 pending.append((decode_events[k_dec], pixel_out, k_dec))
+                next_dec += 1
 
             # --- Flush any ready decoded chunks. In discard mode this only
             # retires the CUDA work; no CPU copy or encoder path is exercised.
@@ -334,6 +365,7 @@ def run_streaming_inference(
                 n_pixel_frames += n_frames
                 if first_chunk_frames is None:
                     first_chunk_frames = n_frames
+            t += 1
 
         # Drain.
         while pending:

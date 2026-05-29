@@ -1299,10 +1299,8 @@ class SanaWMPipeline:
             sink_token=params.sink_token,
             use_softmax_attention=True,
         )
-        # Stage-1's create_autoregressive_segments returns `latent_T // bc`
-        # chunks (chunk 0 absorbs the temporal-stride remainder), so the chunk
-        # count is integer-divided here -- NOT ceil-divided.
-        n_stage1_chunks = latent_T // params.num_frame_per_block
+        stage1_chunk_indices = tuple(int(v) for v in solver.create_autoregressive_segments(latent_T))
+        n_stage1_chunks = len(stage1_chunk_indices) - 1
         stage1_iter = solver.sample_chunks(
             z,
             steps=params.step,
@@ -1380,6 +1378,7 @@ class SanaWMPipeline:
             lazy_vae_decoder=lazy_vae_decoder,
             sequential_offload=sequential_offload,
             stage1_done_callback=_offload_stage1_after_streaming_sample if sequential_offload else None,
+            stage1_chunk_ends=stage1_chunk_indices[1:],
         )
         result = run_streaming_inference(
             stage1_chunk_iter=stage1_iter,
