@@ -131,7 +131,7 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Latent frames per stage-1 AR chunk (must match the model's chunk_size).")
     p.add_argument("--refiner_block_size", type=int, default=3,
                    help="Refiner latent frames per AR block.")
-    p.add_argument("--refiner_kv_max_frames", type=int, default=11,
+    p.add_argument("--refiner_kv_max_frames", type=int, default=10,
                    help="Refiner KV sliding-window size (sink + history + active).")
     p.add_argument("--refiner_seed", type=int, default=42)
     p.add_argument("--sink_size", type=int, default=1)
