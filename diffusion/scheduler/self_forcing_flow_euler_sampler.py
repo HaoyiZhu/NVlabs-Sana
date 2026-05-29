@@ -443,6 +443,9 @@ class SelfForcingFlowEulerCamCtrl(SelfForcingFlowEuler):
         self._chunk_indices = chunk_indices
         num_chunks = len(chunk_indices) - 1
         kv_cache = self._initialize_kv_cache(num_chunks)
+        kv_save_stride = int(os.environ.get("SANA_WM_STAGE1_KV_SAVE_STRIDE", "1"))
+        if kv_save_stride < 0:
+            raise ValueError("SANA_WM_STAGE1_KV_SAVE_STRIDE must be >= 0.")
 
         assert self.condition.shape[0] == batch_size or self.condition.shape[0] == num_chunks
         if self.condition.shape[0] == batch_size:
@@ -624,28 +627,37 @@ class SelfForcingFlowEulerCamCtrl(SelfForcingFlowEuler):
                     latents = latents.to(latents_dtype)
 
             # KV cache save pass — populates the chunk's clean-sigma K/V for
-            # future chunks' self-attention.
-            latent_model_input = (
-                torch.cat([latents[:, :, start_f:end_f]] * 2)
-                if do_classifier_free_guidance
-                else latents[:, :, start_f:end_f]
+            # future chunks' self-attention. A stride >1 is an experimental
+            # Stage-1-only approximation; stage 2 still refines every chunk.
+            do_kv_save = kv_save_stride == 1 or (
+                kv_save_stride > 1 and chunk_idx % kv_save_stride == 0
             )
-            timestep = torch.zeros(latent_model_input.shape[0], device=device)
+            if kv_save_stride == 0:
+                do_kv_save = bool(self.sink_token and chunk_idx == 0)
+            if do_kv_save:
+                latent_model_input = (
+                    torch.cat([latents[:, :, start_f:end_f]] * 2)
+                    if do_classifier_free_guidance
+                    else latents[:, :, start_f:end_f]
+                )
+                timestep = torch.zeros(latent_model_input.shape[0], device=device)
 
-            noise_pred, updated_kv_cache = self.model(
-                latent_model_input,
-                timestep,
-                prompt_embeds,
-                start_f=rope_start_f,
-                end_f=rope_end_f,
-                frame_index=frame_index,
-                save_kv_cache=True,
-                kv_cache=chunk_kv_cache,
-                mask=mask,
-                data_info=local_data_info,
-                **self.model_kwargs,
-            )
-            kv_cache[chunk_idx] = updated_kv_cache
+                noise_pred, updated_kv_cache = self.model(
+                    latent_model_input,
+                    timestep,
+                    prompt_embeds,
+                    start_f=rope_start_f,
+                    end_f=rope_end_f,
+                    frame_index=frame_index,
+                    save_kv_cache=True,
+                    kv_cache=chunk_kv_cache,
+                    mask=mask,
+                    data_info=local_data_info,
+                    **self.model_kwargs,
+                )
+                kv_cache[chunk_idx] = updated_kv_cache
+            else:
+                kv_cache[chunk_idx] = [[None] * _NUM_CACHE_SLOTS for _ in range(self.num_model_blocks)]
 
             yield chunk_idx, latents[:, :, start_f:end_f], start_f, end_f
 
@@ -707,12 +719,19 @@ class SelfForcingFlowEulerCamCtrl(SelfForcingFlowEuler):
                 valid_cached_chunks = [0] + list(range(s, chunk_idx))
                 sink_num = self._chunk_indices[1] - self._chunk_indices[0]
 
+        valid_cached_chunks = [
+            i
+            for i in valid_cached_chunks
+            if kv_cache[i][0][_SLOT_K] is not None or kv_cache[i][0][_SLOT_TYPE_FLAG] is not None
+        ]
+
         # Count cached frames in latent units (independent of patch_size). The
         # sampler builds frame_index in latent units so this stays consistent.
         num_cached_frames = sum(self._chunk_indices[i + 1] - self._chunk_indices[i] for i in valid_cached_chunks)
+        prev_cache_idx = valid_cached_chunks[-1] if valid_cached_chunks else chunk_idx
 
         for block_id in range(self.num_model_blocks):
-            prev_last = kv_cache[chunk_idx - 1][block_id]
+            prev_last = kv_cache[prev_cache_idx][block_id]
 
             # Detect cache layout from type flag (slot 6).
             type_flag = prev_last[_SLOT_TYPE_FLAG] if prev_last[_SLOT_TYPE_FLAG] is not None else None

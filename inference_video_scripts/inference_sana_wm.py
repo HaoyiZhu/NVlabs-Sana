@@ -39,6 +39,7 @@ import logging
 import math
 import os
 import time
+import types
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -66,7 +67,13 @@ from diffusion.model.builder import (
     vae_encode,
 )
 from diffusion.model.utils import get_weight_dtype
-from diffusion.refiner.diffusers_ltx2_refiner import STAGE_2_DISTILLED_SIGMA_VALUES, DiffusersLTX2Refiner
+from diffusion.refiner.diffusers_ltx2_refiner import (
+    STAGE_2_DISTILLED_SIGMA_VALUES,
+    DiffusersLTX2Refiner,
+    _env_flag as _te_env_flag,
+    _env_tuple as _te_env_tuple,
+    _replace_linear_with_te_nvfp4,
+)
 from diffusion.scheduler.self_forcing_flow_euler_sampler import SelfForcingFlowEulerCamCtrl
 from diffusion.utils.action_overlay import apply_overlay
 from diffusion.utils.cam_utils import compute_raymap, get_pose_inverse
@@ -99,6 +106,80 @@ HF_DEFAULTS = {
     "refiner_root": f"hf://{HF_REPO}/refiner",
     "refiner_gemma_root": f"hf://{HF_REPO}/refiner/text_encoder",
 }
+
+_ENV_TRUE = {"1", "true", "yes", "on"}
+_ENV_FALSE = {"", "0", "false", "no", "off"}
+_STAGE1_NVFP4_SKIP_DEFAULTS = (
+    "^x_embedder",
+    "^raymap_embedder",
+    "^plucker_embedder",
+    "^t_embedder",
+    "^t_block",
+    "^y_embedder",
+    "^final_layer",
+)
+_STAGE1_NVFP4_INCLUDE_BY_MODE = {
+    "self_proj": (r"^blocks\.\d+\.attn\.proj$",),
+    "self_qkv": (r"^blocks\.\d+\.attn\.qkv$",),
+    "self_attn": (
+        r"^blocks\.\d+\.attn\.qkv$",
+        r"^blocks\.\d+\.attn\.proj$",
+        r"^blocks\.\d+\.attn\.beta_proj$",
+        r"^blocks\.\d+\.attn\.gate_proj$",
+        r"^blocks\.\d+\.attn\.output_gate$",
+    ),
+    "cam": (
+        r"^blocks\.\d+\.attn\.q_proj_cam$",
+        r"^blocks\.\d+\.attn\.k_proj_cam$",
+        r"^blocks\.\d+\.attn\.v_proj_cam$",
+        r"^blocks\.\d+\.attn\.out_proj_cam$",
+    ),
+    "cross": (r"^blocks\.\d+\.cross_attn\.",),
+}
+
+
+def _stage1_nvfp4_mode() -> str:
+    raw = os.environ.get("SANA_WM_STAGE1_NVFP4", "").strip().lower()
+    if raw in _ENV_FALSE:
+        return ""
+    mode = os.environ.get("SANA_WM_STAGE1_NVFP4_MODE", "").strip().lower()
+    if not mode and raw not in _ENV_TRUE:
+        mode = raw
+    return mode or "self_qkv"
+
+
+def _stage1_nvfp4_include_patterns(mode: str) -> tuple[str, ...] | None:
+    if mode in {"all", "full"}:
+        if not _te_env_flag("SANA_WM_STAGE1_NVFP4_ALLOW_FULL"):
+            raise ValueError(
+                "Stage-1 full NVFP4 is experimental and showed visible quality loss in validation; "
+                "set SANA_WM_STAGE1_NVFP4_ALLOW_FULL=1 to force it."
+            )
+        return None
+    patterns: list[str] = []
+    for item in mode.replace("+", ",").split(","):
+        key = item.strip()
+        if not key:
+            continue
+        if key not in _STAGE1_NVFP4_INCLUDE_BY_MODE:
+            raise ValueError(
+                f"Unsupported SANA_WM_STAGE1_NVFP4_MODE={mode!r}; "
+                f"supported={sorted([*list(_STAGE1_NVFP4_INCLUDE_BY_MODE), 'all', 'full'])}"
+            )
+        patterns.extend(_STAGE1_NVFP4_INCLUDE_BY_MODE[key])
+    patterns.extend(_te_env_tuple("SANA_WM_STAGE1_NVFP4_INCLUDE_PATTERNS"))
+    return tuple(dict.fromkeys(patterns))
+
+
+def _stage1_nvfp4_uses_cross_attention() -> bool:
+    mode = _stage1_nvfp4_mode()
+    if not mode:
+        return False
+    if mode in {"all", "full"}:
+        return True
+    if any(item.strip() == "cross" for item in mode.replace("+", ",").split(",")):
+        return True
+    return any("cross_attn" in pattern for pattern in _te_env_tuple("SANA_WM_STAGE1_NVFP4_INCLUDE_PATTERNS"))
 
 # Action-string rollout defaults. Rotation is intentionally slower than
 # translation so casual WASD+IJKL strings produce natural trajectories.
@@ -608,6 +689,56 @@ class SanaWMPipeline:
             self.logger.warning(f"Unexpected keys: {unexpected}")
         self.model = model.eval().to(self.weight_dtype)
 
+    def _prepare_stage1_nvfp4(self) -> None:
+        mode = _stage1_nvfp4_mode()
+        if not mode:
+            return
+        model = getattr(self, "model", None)
+        if model is None or getattr(model, "_sana_wm_stage1_nvfp4_converted", False):
+            return
+
+        import transformer_engine.common.recipe as te_recipe
+        import transformer_engine.pytorch as te
+
+        recipe = te_recipe.NVFP4BlockScaling(
+            disable_rht=True,
+            disable_stochastic_rounding=True,
+        )
+        skip_patterns: tuple[str, ...] = ()
+        if not _te_env_flag("SANA_WM_STAGE1_NVFP4_NO_DEFAULT_SKIPS"):
+            skip_patterns = _STAGE1_NVFP4_SKIP_DEFAULTS
+        skip_patterns = tuple(dict.fromkeys((*skip_patterns, *_te_env_tuple("SANA_WM_STAGE1_NVFP4_SKIP_PATTERNS"))))
+        include_patterns = _stage1_nvfp4_include_patterns(mode)
+        converted, skipped = _replace_linear_with_te_nvfp4(
+            model,
+            recipe=recipe,
+            params_dtype=self.weight_dtype,
+            skip_patterns=skip_patterns,
+            include_patterns=include_patterns,
+        )
+        if converted <= 0:
+            raise RuntimeError(
+                f"SANA_WM_STAGE1_NVFP4={mode!r} converted no Linear layers; "
+                f"skipped={skipped}, include_patterns={include_patterns}."
+            )
+
+        orig_forward_long = model.forward_long
+
+        def _forward_long_nvfp4(_self, *args, **kwargs):
+            with te.fp8_autocast(enabled=True, fp8_recipe=recipe):
+                return orig_forward_long(*args, **kwargs)
+
+        model.forward_long = types.MethodType(_forward_long_nvfp4, model)
+        model._sana_wm_stage1_nvfp4_converted = True
+        model._sana_wm_stage1_nvfp4_recipe = recipe
+        self.logger.info(
+            "[stage1-nvfp4] mode=%s converted %d Linear layers (skipped %d)",
+            mode,
+            converted,
+            skipped,
+        )
+        torch.cuda.empty_cache()
+
     def _build_refiner(self) -> None:
         if self.refiner_settings is None:
             self._refiner_built = False
@@ -773,6 +904,35 @@ class SanaWMPipeline:
         self._offload_text_encoder()
         return cond, cond_mask, neg[:, None], neg_mask
 
+    def _pad_stage1_text_for_nvfp4(
+        self,
+        cond: torch.Tensor,
+        cond_mask: torch.Tensor,
+        neg: torch.Tensor,
+        neg_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if not _stage1_nvfp4_uses_cross_attention():
+            return cond, cond_mask, neg, neg_mask
+        multiple = int(os.environ.get("SANA_WM_STAGE1_NVFP4_TEXT_PAD_MULTIPLE", "8"))
+        if multiple <= 1:
+            return cond, cond_mask, neg, neg_mask
+
+        def pad_pair(text: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            pad = (-text.shape[-2]) % multiple
+            if pad == 0:
+                return text, mask
+            text_pad_shape = list(text.shape)
+            text_pad_shape[-2] = pad
+            mask_pad_shape = list(mask.shape)
+            mask_pad_shape[-1] = pad
+            text = torch.cat([text, text.new_zeros(text_pad_shape)], dim=-2)
+            mask = torch.cat([mask, mask.new_zeros(mask_pad_shape)], dim=-1)
+            return text, mask
+
+        cond, cond_mask = pad_pair(cond, cond_mask)
+        neg, neg_mask = pad_pair(neg, neg_mask)
+        return cond, cond_mask, neg, neg_mask
+
     def _sample_stage1(
         self,
         image: Image.Image,
@@ -799,6 +959,7 @@ class SanaWMPipeline:
             self._offload_vae_encoder_for_streaming()
 
         cond, cond_mask, neg, neg_mask = self._encode_prompts(prompt, params.negative_prompt)
+        cond, cond_mask, neg, neg_mask = self._pad_stage1_text_for_nvfp4(cond, cond_mask, neg, neg_mask)
         raymap = camera["raymap"].unsqueeze(0).to(self.device, dtype=self.weight_dtype)
         chunk_plucker = camera["chunk_plucker"].unsqueeze(0).to(self.device, dtype=self.weight_dtype)
         if params.cfg_scale > 1.0:
@@ -836,6 +997,7 @@ class SanaWMPipeline:
             model_kwargs["chunk_index"] = chunk_index
 
         flow_shift = self._resolve_flow_shift(params.flow_shift)
+        self._prepare_stage1_nvfp4()
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         t0 = time.perf_counter()
@@ -1086,6 +1248,7 @@ class SanaWMPipeline:
             torch.cuda.empty_cache()
 
         cond, cond_mask, neg, neg_mask = self._encode_prompts(prompt, params.negative_prompt)
+        cond, cond_mask, neg, neg_mask = self._pad_stage1_text_for_nvfp4(cond, cond_mask, neg, neg_mask)
         raymap = camera["raymap"].unsqueeze(0).to(self.device, dtype=self.weight_dtype)
         chunk_plucker = camera["chunk_plucker"].unsqueeze(0).to(self.device, dtype=self.weight_dtype)
         if params.cfg_scale > 1.0:
@@ -1160,6 +1323,7 @@ class SanaWMPipeline:
         self.refiner.prepare_transformer_nvfp4()
         torch.cuda.empty_cache()
         self.model.to(self.device)
+        self._prepare_stage1_nvfp4()
         torch.cuda.empty_cache()
         lazy_vae_decoder = os.environ.get("SANA_WM_STREAMING_LAZY_VAE_DECODER", "").lower() in {
             "1",

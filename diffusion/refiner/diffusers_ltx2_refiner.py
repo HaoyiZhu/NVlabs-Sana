@@ -1318,6 +1318,7 @@ def _replace_linear_with_te_nvfp4(
     recipe,
     params_dtype: torch.dtype,
     skip_patterns: tuple[str, ...],
+    include_patterns: tuple[str, ...] | None = None,
     prefix: str = "",
 ) -> tuple[int, int]:
     import re
@@ -1331,6 +1332,11 @@ def _replace_linear_with_te_nvfp4(
             skipped += 1
             continue
         if isinstance(child, nn.Linear):
+            if include_patterns is not None and not any(
+                re.search(pattern, child_prefix) for pattern in include_patterns
+            ):
+                skipped += 1
+                continue
             if child.in_features % 16 != 0 or child.out_features % 16 != 0:
                 skipped += 1
                 continue
@@ -1361,6 +1367,7 @@ def _replace_linear_with_te_nvfp4(
             recipe=recipe,
             params_dtype=params_dtype,
             skip_patterns=skip_patterns,
+            include_patterns=include_patterns,
             prefix=child_prefix,
         )
         converted += child_converted
