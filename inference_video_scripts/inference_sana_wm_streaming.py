@@ -161,6 +161,8 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Move the VAE to CPU between encode/decode steps.")
     p.add_argument("--offload_refiner", action="store_true",
                    help="Lazy-load the LTX-2 refiner only when needed; release afterwards.")
+    p.add_argument("--offload_text_encoder", action="store_true",
+                   help="Move the stage-1 text encoder to CPU after prompt encoding to save GPU memory.")
     return p
 
 
@@ -257,6 +259,7 @@ def main() -> None:
         refiner=refiner,
         offload_vae=args.offload_vae,
         offload_refiner=args.offload_refiner,
+        offload_text_encoder=args.offload_text_encoder,
         logger=logger,
     )
 

@@ -537,6 +537,7 @@ class SanaWMPipeline:
         refiner: RefinerSettings | None = None,
         offload_vae: bool = False,
         offload_refiner: bool = False,
+        offload_text_encoder: bool = False,
         logger: logging.Logger | None = None,
     ):
         self.config = config
@@ -544,6 +545,7 @@ class SanaWMPipeline:
         self.refiner_settings = refiner
         self.offload_vae = offload_vae
         self.offload_refiner = offload_refiner
+        self.offload_text_encoder = offload_text_encoder
         self.logger = logger or get_root_logger()
         self.weight_dtype = get_weight_dtype(config.model.mixed_precision)
         self.vae_dtype = get_weight_dtype(config.vae.weight_dtype)
@@ -551,6 +553,8 @@ class SanaWMPipeline:
 
         self._build_vae()
         self._build_text_encoder()
+        if self.offload_text_encoder:
+            self._offload_text_encoder()
         self._build_model(model_path)
         if refiner is not None and not offload_refiner:
             self._build_refiner()
@@ -657,6 +661,30 @@ class SanaWMPipeline:
         torch.cuda.empty_cache()
         gc.collect()
 
+    def _offload_text_encoder(self) -> None:
+        if not self.offload_text_encoder:
+            return
+        text_encoder = getattr(self, "text_encoder", None)
+        if text_encoder is None:
+            return
+        text_encoder.to("cpu")
+        torch.cuda.empty_cache()
+
+    def _offload_vae_encoder_for_streaming(self) -> None:
+        vae = getattr(self, "vae", None)
+        encoder = getattr(vae, "encoder", None)
+        if encoder is not None:
+            encoder.to("cpu")
+            torch.cuda.empty_cache()
+
+    def _move_vae_decoder_for_streaming(self, device: torch.device | str) -> None:
+        vae = getattr(self, "vae", None)
+        decoder = getattr(vae, "decoder", None)
+        if decoder is not None:
+            decoder.to(device)
+        elif vae is not None:
+            vae.to(device)
+
     # ------- generation -------
 
     @torch.inference_mode()
@@ -730,6 +758,8 @@ class SanaWMPipeline:
             max_length_all = max_length
 
         def encode(text: str, length: int) -> tuple[torch.Tensor, torch.Tensor]:
+            if self.offload_text_encoder:
+                self.text_encoder.to(self.device)
             tok = self.tokenizer(
                 [text], max_length=length, padding="max_length", truncation=True, return_tensors="pt"
             ).to(self.device)
@@ -740,6 +770,7 @@ class SanaWMPipeline:
         cond = cond[:, None][:, :, select]
         cond_mask = cond_mask[:, select]
         neg, neg_mask = encode(negative_prompt, max_length)
+        self._offload_text_encoder()
         return cond, cond_mask, neg[:, None], neg_mask
 
     def _sample_stage1(
@@ -764,6 +795,8 @@ class SanaWMPipeline:
         if self.offload_vae:
             self.vae.to("cpu")
             torch.cuda.empty_cache()
+        else:
+            self._offload_vae_encoder_for_streaming()
 
         cond, cond_mask, neg, neg_mask = self._encode_prompts(prompt, params.negative_prompt)
         raymap = camera["raymap"].unsqueeze(0).to(self.device, dtype=self.weight_dtype)
@@ -1114,13 +1147,42 @@ class SanaWMPipeline:
             denoising_step_list=params.denoising_step_list,
         )
 
-        # Encode refiner prompt with Gemma. The refiner caches the Gemma weights
-        # internally, so it's cheap; transformer is briefly offloaded to CPU to
-        # leave headroom for Gemma's forward, matching the legacy refine path.
-        self.refiner.transformer.to("cpu")
+        # Encode the refiner prompt with Gemma before the timed streaming loop.
+        # A 32GB 5090 cannot hold Gemma plus the resident DiT/VAE/refiner stack,
+        # so temporarily spill the generation models while the prompt is encoded.
+        self.model.to("cpu")
+        self._move_vae_decoder_for_streaming("cpu")
+        self.refiner.move_video_modules("cpu")
         torch.cuda.empty_cache()
         refiner_prompt_embeds, refiner_prompt_attention_mask = self.refiner._encode_prompt(prompt)
-        self.refiner.transformer.to(self.device)
+        self.refiner.move_video_modules(self.device)
+        self.refiner.offload_video_unused_audio_modules("cpu")
+        self.refiner.prepare_transformer_nvfp4()
+        torch.cuda.empty_cache()
+        self.model.to(self.device)
+        torch.cuda.empty_cache()
+        lazy_vae_decoder = os.environ.get("SANA_WM_STREAMING_LAZY_VAE_DECODER", "").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        sequential_offload = os.environ.get("SANA_WM_STREAMING_SEQUENTIAL_OFFLOAD", "").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if lazy_vae_decoder:
+            self._move_vae_decoder_for_streaming("cpu")
+        else:
+            self._move_vae_decoder_for_streaming(self.device)
+        self._offload_vae_encoder_for_streaming()
+
+        def _offload_stage1_after_streaming_sample() -> None:
+            self.model.to("cpu")
+            self._move_vae_decoder_for_streaming("cpu")
+            torch.cuda.empty_cache()
 
         sigmas_t = torch.tensor(STAGE_2_DISTILLED_SIGMA_VALUES, dtype=torch.float32, device=self.device)
         refiner_runner = RefinerChunkRunner(
@@ -1151,6 +1213,9 @@ class SanaWMPipeline:
             profile_cuda=bool(profile_cuda),
             sample_frames_path=sample_frames_path,
             sample_frame_stride=int(sample_frame_stride),
+            lazy_vae_decoder=lazy_vae_decoder,
+            sequential_offload=sequential_offload,
+            stage1_done_callback=_offload_stage1_after_streaming_sample if sequential_offload else None,
         )
         result = run_streaming_inference(
             stage1_chunk_iter=stage1_iter,

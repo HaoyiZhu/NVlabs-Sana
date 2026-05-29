@@ -91,7 +91,7 @@ class MultiHeadCrossAttention(nn.Module):
             x = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False)
             x = x.transpose(1, 2)
 
-        x = x.view(B, -1, C)
+        x = x.reshape(B, -1, C)
         x = self.proj(x)
         x = self.proj_drop(x)
 
@@ -149,7 +149,7 @@ class MultiHeadCrossAttentionImageEmbed(nn.Module):
         x = x + F.scaled_dot_product_attention(q, image_k, image_v, dropout_p=0.0, is_causal=False)
         x = x.transpose(1, 2)
 
-        x = x.view(B, -1, C)
+        x = x.reshape(B, -1, C)
         x = self.proj(x)
         x = self.proj_drop(x)
 
@@ -201,7 +201,7 @@ class MultiHeadCrossVallinaAttention(MultiHeadCrossAttention):
         x = x.to(dtype)
         x = x.transpose(1, 2).contiguous()
 
-        x = x.view(B, -1, C)
+        x = x.reshape(B, -1, C)
         x = self.proj(x)
         x = self.proj_drop(x)
 

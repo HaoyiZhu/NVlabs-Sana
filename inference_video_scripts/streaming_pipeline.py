@@ -23,7 +23,7 @@ from collections import deque
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 import time
 
 import numpy as np
@@ -49,6 +49,9 @@ class StreamingPipelineConfig:
     profile_cuda: bool = False
     sample_frames_path: str | Path | None = None
     sample_frame_stride: int = 0
+    lazy_vae_decoder: bool = False
+    sequential_offload: bool = False
+    stage1_done_callback: Callable[[], None] | None = None
 
 
 @dataclass
@@ -135,6 +138,18 @@ def run_streaming_inference(
         f"stage1_chunks={n_stage1_chunks} refiner_blocks={n_refiner} "
         f"decode_chunks={n_decode} output_mode={output_mode}"
     )
+    if bool(config.sequential_offload):
+        return _run_streaming_inference_sequential(
+            stage1_chunk_iter=stage1_chunk_iter,
+            n_stage1_chunks=n_stage1_chunks,
+            z_init=z_init,
+            refiner_runner=refiner_runner,
+            vae_streaming_decoder=vae_streaming_decoder,
+            pixel_h=pixel_h,
+            pixel_w=pixel_w,
+            config=config,
+            logger=logger,
+        )
 
     # Pre-allocated mirror buffers. Slices into these are handed across
     # streams; the storage is long-lived so no record_stream is needed.
@@ -175,6 +190,13 @@ def run_streaming_inference(
     decode_timing_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
 
     vae_streaming_decoder.reset()
+    decoder_on_device = True
+    if bool(config.lazy_vae_decoder) and device.type == "cuda":
+        decoder = getattr(vae_streaming_decoder.vae, "decoder", None)
+        if decoder is not None:
+            decoder.to("cpu")
+            torch.cuda.empty_cache()
+            decoder_on_device = False
 
     pending: deque[tuple[torch.cuda.Event | None, torch.Tensor | int, int]] = deque()
     writer = None
@@ -269,6 +291,11 @@ def run_streaming_inference(
                     timing_start = _new_timing_event()
                     timing_end = _new_timing_event()
                     _record(timing_start, decode_stream)
+                    if not decoder_on_device:
+                        decoder = getattr(vae_streaming_decoder.vae, "decoder", None)
+                        if decoder is not None:
+                            decoder.to(device)
+                            decoder_on_device = True
                     pixel_chunk = vae_streaming_decoder.decode_chunk(z_slice)
                     if output_mode == "discard":
                         n_frames = int(pixel_chunk.shape[2])
@@ -400,6 +427,194 @@ def run_streaming_inference(
         stage1_cuda_seconds=stage1_cuda_seconds,
         refiner_cuda_seconds=refiner_cuda_seconds,
         decode_cuda_seconds=decode_cuda_seconds,
+        sample_frames_path=sample_frames_path,
+        sampled_frame_count=len(sample_frame_indices),
+        sampled_frame_indices=sample_frame_indices,
+    )
+
+
+@torch.inference_mode()
+def _run_streaming_inference_sequential(
+    *,
+    stage1_chunk_iter: Iterator[tuple[int, torch.Tensor, int, int]],
+    n_stage1_chunks: int,
+    z_init: torch.Tensor,
+    refiner_runner: RefinerChunkRunner,
+    vae_streaming_decoder: CausalVaeStreamingDecoder,
+    pixel_h: int,
+    pixel_w: int,
+    config: StreamingPipelineConfig,
+    logger=None,
+) -> StreamingPipelineResult:
+    """Memory-first path: finish stage-1, offload it, then refine/decode."""
+    log = (logger.info if logger is not None else print)
+
+    sink_size = int(config.sink_size)
+    block_size = int(config.block_size)
+    T_latent = int(z_init.shape[2])
+    n_refiner = max(T_latent - sink_size, 0) // block_size
+    n_decode = n_refiner
+    output_mode = str(config.output_mode)
+    device = z_init.device
+
+    log("[stream] sequential_offload=1: stage1 -> offload -> refiner -> decode")
+
+    latents_full = torch.empty_like(z_init)
+    latents_full[:, :, :sink_size] = z_init[:, :, :sink_size]
+    refined_full = torch.empty_like(z_init)
+    refined_full[:, :, :sink_size] = z_init[:, :, :sink_size]
+
+    writer = None
+    if output_mode == "mp4":
+        writer = StreamingMp4Writer(
+            config.output_path,
+            height=int(pixel_h),
+            width=int(pixel_w),
+            fps=int(config.fps),
+            crf=int(config.mp4_crf),
+            preset=str(config.mp4_preset),
+        )
+
+    sample_frames: list[np.ndarray] = []
+    sample_frame_indices: list[int] = []
+    sample_frames_path = Path(config.sample_frames_path) if config.sample_frames_path is not None else None
+    sample_frame_stride = int(config.sample_frame_stride)
+
+    def _collect_sample_frames(pixel_np: np.ndarray, frame_base: int) -> None:
+        if sample_frames_path is None:
+            return
+        for local_idx in range(0, int(pixel_np.shape[0])):
+            frame_idx = int(frame_base + local_idx)
+            if frame_idx % sample_frame_stride == 0:
+                sample_frames.append(pixel_np[local_idx].copy())
+                sample_frame_indices.append(frame_idx)
+
+    t_start = time.perf_counter()
+    stage1_t0 = time.perf_counter()
+    first_chunk_seconds: float | None = None
+    first_chunk_frames: int | None = None
+    n_pixel_frames = 0
+    out_path: Path | None = None
+    try:
+        for _ in range(n_stage1_chunks):
+            _, latent_view, start_f, end_f = next(stage1_chunk_iter)
+            latents_full[:, :, start_f:end_f].copy_(latent_view, non_blocking=True)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        stage1_seconds = time.perf_counter() - stage1_t0
+
+        if config.stage1_done_callback is not None:
+            config.stage1_done_callback()
+
+        refiner_t0 = time.perf_counter()
+        for k_ref in range(n_refiner):
+            block_start = sink_size + k_ref * block_size
+            block_end = block_start + block_size
+            clean_block = latents_full[:, :, block_start:block_end]
+            sink_seed = latents_full[:, :, :sink_size] if k_ref == 0 else None
+            refined_block = refiner_runner.refine_block(
+                block_idx=k_ref,
+                clean_block=clean_block,
+                block_start=block_start,
+                block_end=block_end,
+                sink_seed_frames=sink_seed,
+            )
+            refined_full[:, :, block_start:block_end].copy_(refined_block, non_blocking=True)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        refiner_seconds = time.perf_counter() - refiner_t0
+
+        decoder = getattr(vae_streaming_decoder.vae, "decoder", None)
+        if decoder is not None:
+            decoder.to(device)
+        vae_streaming_decoder.reset()
+
+        decode_t0 = time.perf_counter()
+        for k_dec in range(n_decode):
+            if k_dec == 0:
+                z_slice = refined_full[:, :, : sink_size + block_size]
+            else:
+                z_slice = refined_full[
+                    :, :, sink_size + k_dec * block_size : sink_size + (k_dec + 1) * block_size
+                ]
+            pixel_chunk = vae_streaming_decoder.decode_chunk(z_slice)
+            if output_mode == "discard":
+                n_frames = int(pixel_chunk.shape[2])
+                if k_dec == 0 and config.drop_first_pixel:
+                    n_frames -= 1
+            else:
+                pixel_uint8 = (pixel_chunk.float() * 127.5 + 127.5).clamp(0, 255).to(torch.uint8)
+                pixel_np = pixel_uint8.permute(0, 2, 3, 4, 1).contiguous().to("cpu").numpy()[0]
+                if k_dec == 0 and config.drop_first_pixel:
+                    pixel_np = pixel_np[1:]
+                n_frames = int(pixel_np.shape[0])
+                _collect_sample_frames(pixel_np, n_pixel_frames)
+                if output_mode == "mp4":
+                    assert writer is not None
+                    writer.write_chunk(pixel_np)
+            if first_chunk_seconds is None:
+                first_chunk_seconds = time.perf_counter() - t_start
+                first_chunk_frames = n_frames
+            n_pixel_frames += max(0, n_frames)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        decode_seconds = time.perf_counter() - decode_t0
+
+        out_path = writer.close() if writer is not None else None
+        if sample_frames_path is not None:
+            sample_frames_path.parent.mkdir(parents=True, exist_ok=True)
+            frames = (
+                np.stack(sample_frames, axis=0)
+                if sample_frames
+                else np.empty((0, int(pixel_h), int(pixel_w), 3), dtype=np.uint8)
+            )
+            np.savez_compressed(
+                sample_frames_path,
+                frames=frames,
+                frame_indices=np.asarray(sample_frame_indices, dtype=np.int64),
+            )
+    except Exception:
+        if writer is not None:
+            writer.close()
+        raise
+
+    wall_seconds = time.perf_counter() - t_start
+    frames_per_second = float(n_pixel_frames) / wall_seconds if wall_seconds > 0.0 else 0.0
+    realtime_factor = frames_per_second / float(config.fps) if config.fps else 0.0
+    steady_state_seconds: float | None = None
+    steady_state_frames_per_second: float | None = None
+    steady_state_realtime_factor: float | None = None
+    if first_chunk_seconds is not None and first_chunk_frames is not None:
+        steady_frames = max(0, int(n_pixel_frames) - int(first_chunk_frames))
+        steady_seconds = wall_seconds - float(first_chunk_seconds)
+        if steady_frames > 0 and steady_seconds > 0.0:
+            steady_state_seconds = steady_seconds
+            steady_state_frames_per_second = float(steady_frames) / steady_seconds
+            steady_state_realtime_factor = steady_state_frames_per_second / float(config.fps) if config.fps else 0.0
+
+    log(
+        f"[stream] sequential output_mode={output_mode} frames={n_pixel_frames} "
+        f"wall={wall_seconds:.3f}s fps={frames_per_second:.3f} realtime={realtime_factor:.3f}x "
+        f"stage1={stage1_seconds:.3f}s refiner={refiner_seconds:.3f}s decode={decode_seconds:.3f}s "
+        f"path={out_path} (refiner_blocks={n_refiner}, decode_chunks={n_decode})"
+    )
+    return StreamingPipelineResult(
+        output_path=out_path,
+        n_pixel_frames=n_pixel_frames,
+        n_refiner_blocks=n_refiner,
+        n_decode_chunks=n_decode,
+        output_mode=output_mode,
+        wall_seconds=wall_seconds,
+        first_chunk_seconds=first_chunk_seconds,
+        first_chunk_frames=first_chunk_frames,
+        steady_state_seconds=steady_state_seconds,
+        steady_state_frames_per_second=steady_state_frames_per_second,
+        steady_state_realtime_factor=steady_state_realtime_factor,
+        frames_per_second=frames_per_second,
+        realtime_factor=realtime_factor,
+        stage1_cuda_seconds=stage1_seconds,
+        refiner_cuda_seconds=refiner_seconds,
+        decode_cuda_seconds=decode_seconds,
         sample_frames_path=sample_frames_path,
         sampled_frame_count=len(sample_frame_indices),
         sampled_frame_indices=sample_frame_indices,

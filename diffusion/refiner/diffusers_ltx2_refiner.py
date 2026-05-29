@@ -30,7 +30,9 @@ without materializing the full sequence-by-sequence mask.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import gc
+import os
 from pathlib import Path
 
 import torch
@@ -57,6 +59,10 @@ class DiffusersLTX2Refiner(nn.Module):
         self.dtype = dtype
         self.device = torch.device(device)
         self.text_max_sequence_length = int(text_max_sequence_length)
+        self._te_nvfp4_requested = _env_flag("SANA_WM_REFINER_NVFP4")
+        self._te_nvfp4_recipe = None
+        self._te_nvfp4_converted = False
+        self._attention_backend = os.environ.get("SANA_WM_REFINER_ATTN_BACKEND", "").strip()
 
         self.transformer, self.connectors = self._load_diffusers_components()
 
@@ -69,12 +75,87 @@ class DiffusersLTX2Refiner(nn.Module):
             subfolder="transformer",
             torch_dtype=self.dtype,
         ).eval()
+        if (
+            not self._te_nvfp4_requested
+            and os.environ.get("SANA_WM_REFINER_FP8_STORAGE", "").lower() in {"1", "true", "yes", "on"}
+        ):
+            skip_patterns = None
+            extra_skip_patterns = _env_tuple("SANA_WM_REFINER_FP8_SKIP_PATTERNS")
+            if extra_skip_patterns:
+                from diffusers.hooks.layerwise_casting import DEFAULT_SKIP_MODULES_PATTERN
+
+                skip_patterns = tuple(dict.fromkeys((*DEFAULT_SKIP_MODULES_PATTERN, *extra_skip_patterns)))
+            transformer.enable_layerwise_casting(
+                storage_dtype=torch.float8_e4m3fn,
+                compute_dtype=self.dtype,
+                skip_modules_pattern=skip_patterns,
+            )
         connectors = LTX2TextConnectors.from_pretrained(
             self.refiner_root,
             subfolder="connectors",
             torch_dtype=self.dtype,
         ).eval()
         return transformer, connectors
+
+    def prepare_transformer_nvfp4(self) -> None:
+        """Lazily replace eligible refiner Linear layers with TE NVFP4 Linear modules."""
+        if not self._te_nvfp4_requested or self._te_nvfp4_converted:
+            return
+        import transformer_engine.common.recipe as te_recipe
+
+        recipe = te_recipe.NVFP4BlockScaling(
+            disable_rht=True,
+            disable_stochastic_rounding=True,
+        )
+        converted, skipped = _replace_linear_with_te_nvfp4(
+            self.transformer,
+            recipe=recipe,
+            params_dtype=self.dtype,
+            skip_patterns=tuple(
+                dict.fromkeys(
+                    (
+                        "^proj_in$",
+                        "^proj_out$",
+                        "(^|\\.)audio_",
+                        "audio_to_video",
+                        "video_to_audio",
+                        "av_cross_attn",
+                        "caption_projection",
+                        "time_embed",
+                        *_env_tuple("SANA_WM_REFINER_NVFP4_SKIP_PATTERNS"),
+                    )
+                )
+            ),
+        )
+        if converted <= 0:
+            raise RuntimeError(f"SANA_WM_REFINER_NVFP4=1 converted no Linear layers; skipped={skipped}.")
+        self._te_nvfp4_recipe = recipe
+        self._te_nvfp4_converted = True
+        _empty_cuda_cache()
+
+    def offload_video_unused_audio_modules(self, device: torch.device | str = "cpu") -> None:
+        """Keep LTX-2 audio-only branches off GPU for this wrapper's video-only forward."""
+        _offload_video_unused_audio_modules(self.transformer, device)
+        _empty_cuda_cache()
+
+    def move_video_modules(self, device: torch.device | str) -> None:
+        """Move only the modules and direct parameters used by the video-only forward."""
+        _move_ltx2_video_modules_to(self.transformer, device)
+        _empty_cuda_cache()
+
+    def _nvfp4_autocast(self):
+        if not self._te_nvfp4_converted:
+            return nullcontext()
+        import transformer_engine.pytorch as te
+
+        return te.fp8_autocast(enabled=True, fp8_recipe=self._te_nvfp4_recipe)
+
+    def _attention_backend_context(self):
+        if not self._attention_backend:
+            return nullcontext()
+        from diffusers.models.attention_dispatch import attention_backend
+
+        return attention_backend(self._attention_backend)
 
     @torch.inference_mode()
     def refine_latents(
@@ -123,7 +204,9 @@ class DiffusersLTX2Refiner(nn.Module):
         _empty_cuda_cache()
         prompt_embeds, prompt_attention_mask = self._encode_prompt(prompt)
 
-        self.transformer.to(self.device)
+        self.move_video_modules(self.device)
+        self.offload_video_unused_audio_modules("cpu")
+        self.prepare_transformer_nvfp4()
         z = sana_latent.to(device=self.device, dtype=self.dtype)
         sigmas_t = torch.tensor(sigmas, dtype=torch.float32, device=self.device)
         start_sigma = float(sigmas_t[0])
@@ -499,9 +582,7 @@ class DiffusersLTX2Refiner(nn.Module):
         transformer = self.transformer
         batch_size = hidden_states.size(0)
 
-        if encoder_attention_mask is not None and encoder_attention_mask.ndim == 2:
-            encoder_attention_mask = (1 - encoder_attention_mask.to(hidden_states.dtype)) * -10000.0
-            encoder_attention_mask = encoder_attention_mask.unsqueeze(1)
+        encoder_attention_mask = _prepare_encoder_attention_mask(encoder_attention_mask, hidden_states.dtype)
 
         hidden_states = transformer.proj_in(hidden_states)
         temb, embedded_timestep = transformer.time_embed(
@@ -515,16 +596,17 @@ class DiffusersLTX2Refiner(nn.Module):
         encoder_hidden_states = transformer.caption_projection(encoder_hidden_states)
         encoder_hidden_states = encoder_hidden_states.view(batch_size, -1, hidden_states.size(-1))
 
-        for block in transformer.transformer_blocks:
-            hidden_states = _forward_video_block(
-                block=block,
-                hidden_states=hidden_states,
-                encoder_hidden_states=encoder_hidden_states,
-                temb=temb,
-                video_rotary_emb=video_rotary_emb,
-                encoder_attention_mask=encoder_attention_mask,
-                n_context_tokens=n_context_tokens,
-            )
+        with self._attention_backend_context(), self._nvfp4_autocast():
+            for block in transformer.transformer_blocks:
+                hidden_states = _forward_video_block(
+                    block=block,
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    temb=temb,
+                    video_rotary_emb=video_rotary_emb,
+                    encoder_attention_mask=encoder_attention_mask,
+                    n_context_tokens=n_context_tokens,
+                )
 
         scale_shift_values = transformer.scale_shift_table[None, None] + embedded_timestep[:, :, None]
         shift, scale = scale_shift_values[:, :, 0], scale_shift_values[:, :, 1]
@@ -548,9 +630,7 @@ class DiffusersLTX2Refiner(nn.Module):
         transformer = self.transformer
         batch_size = hidden_states.size(0)
 
-        if encoder_attention_mask is not None and encoder_attention_mask.ndim == 2:
-            encoder_attention_mask = (1 - encoder_attention_mask.to(hidden_states.dtype)) * -10000.0
-            encoder_attention_mask = encoder_attention_mask.unsqueeze(1)
+        encoder_attention_mask = _prepare_encoder_attention_mask(encoder_attention_mask, hidden_states.dtype)
 
         video_coords = transformer.rope.prepare_video_coords(
             batch_size, num_frames, height, width, hidden_states.device, fps=fps
@@ -569,16 +649,17 @@ class DiffusersLTX2Refiner(nn.Module):
         encoder_hidden_states = transformer.caption_projection(encoder_hidden_states)
         encoder_hidden_states = encoder_hidden_states.view(batch_size, -1, hidden_states.size(-1))
 
-        for block in transformer.transformer_blocks:
-            hidden_states = _forward_video_block(
-                block=block,
-                hidden_states=hidden_states,
-                encoder_hidden_states=encoder_hidden_states,
-                temb=temb,
-                video_rotary_emb=video_rotary_emb,
-                encoder_attention_mask=encoder_attention_mask,
-                n_context_tokens=n_context_tokens,
-            )
+        with self._attention_backend_context(), self._nvfp4_autocast():
+            for block in transformer.transformer_blocks:
+                hidden_states = _forward_video_block(
+                    block=block,
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    temb=temb,
+                    video_rotary_emb=video_rotary_emb,
+                    encoder_attention_mask=encoder_attention_mask,
+                    n_context_tokens=n_context_tokens,
+                )
 
         scale_shift_values = transformer.scale_shift_table[None, None] + embedded_timestep[:, :, None]
         shift, scale = scale_shift_values[:, :, 0], scale_shift_values[:, :, 1]
@@ -643,6 +724,7 @@ class RefinerChunkRunner:
         self._device = refiner.device
         self._dtype = refiner.dtype
         self._generator = torch.Generator(device=self._device).manual_seed(int(seed))
+        self._kv_cache_storage_dtype = _resolve_kv_cache_storage_dtype()
 
         transformer = refiner.transformer
         self._n_layers = len(transformer.transformer_blocks)
@@ -718,15 +800,18 @@ class RefinerChunkRunner:
                     f"but source_sink_frames={self._source_sink_frames}."
                 )
             source_sink = sink_seed_frames.contiguous()
-            self._sink_kv_pre = refiner._capture_block_kv(
-                clean_block=source_sink,
-                frame_positions=list(range(self._source_sink_frames)),
-                prompt_embeds=self._prompt_embeds,
-                prompt_attention_mask=self._prompt_attention_mask,
-                fps=self._fps,
-                capture_mode="pre_rope",
-                kv_prefix_per_layer=None,
-            )
+            self._sink_kv_pre = [
+                _store_kv_pair(pair, self._kv_cache_storage_dtype)
+                for pair in refiner._capture_block_kv(
+                    clean_block=source_sink,
+                    frame_positions=list(range(self._source_sink_frames)),
+                    prompt_embeds=self._prompt_embeds,
+                    prompt_attention_mask=self._prompt_attention_mask,
+                    fps=self._fps,
+                    capture_mode="pre_rope",
+                    kv_prefix_per_layer=None,
+                )
+            ]
 
         # 2) Build per-window kv_prefix dict per layer.
         sink_rope_offset = block_start - self._history_frames - self._source_sink_frames
@@ -796,10 +881,23 @@ class RefinerChunkRunner:
         )
         for layer_idx in range(self._n_layers):
             new_k, new_v = block_kv_post[layer_idx]
+            new_k = _store_kv_tensor(new_k, self._kv_cache_storage_dtype)
+            new_v = _store_kv_tensor(new_v, self._kv_cache_storage_dtype)
             old = self._history_kv_post[layer_idx]
             if old is None:
-                self._history_kv_post[layer_idx] = (new_k, new_v)
+                if self._max_history_frames > 0 and active_len > self._max_history_frames:
+                    keep_tokens = self._max_history_frames * self._tokens_per_frame
+                    self._history_kv_post[layer_idx] = (new_k[:, -keep_tokens:], new_v[:, -keep_tokens:])
+                else:
+                    self._history_kv_post[layer_idx] = (new_k, new_v)
             else:
+                if self._max_history_frames > 0:
+                    keep_old_frames = max(0, self._max_history_frames - active_len)
+                    keep_old_tokens = keep_old_frames * self._tokens_per_frame
+                    old = (
+                        old[0][:, -keep_old_tokens:] if keep_old_tokens > 0 else old[0][:, :0],
+                        old[1][:, -keep_old_tokens:] if keep_old_tokens > 0 else old[1][:, :0],
+                    )
                 self._history_kv_post[layer_idx] = (
                     torch.cat([old[0], new_k], dim=1),
                     torch.cat([old[1], new_v], dim=1),
@@ -1169,6 +1267,164 @@ def _unpack_latents(
     latents = latents.reshape(batch_size, num_frames, height, width, -1, patch_size_t, patch_size, patch_size)
     latents = latents.permute(0, 4, 1, 5, 2, 6, 3, 7).flatten(6, 7).flatten(4, 5).flatten(2, 3)
     return latents
+
+
+def _prepare_encoder_attention_mask(mask: torch.Tensor | None, dtype: torch.dtype) -> torch.Tensor | None:
+    if mask is None:
+        return None
+    if mask.ndim != 2:
+        return mask
+    if bool(torch.all(mask)):
+        return None
+    return ((1 - mask.to(dtype)) * -10000.0).unsqueeze(1)
+
+
+def _resolve_kv_cache_storage_dtype() -> torch.dtype | None:
+    raw = os.environ.get("SANA_WM_REFINER_KV_CACHE_DTYPE", "").strip().lower()
+    if not raw or raw in {"bf16", "bfloat16", "none", "off", "0"}:
+        return None
+    if raw in {"fp8", "fp8_e4m3", "fp8_e4m3fn", "float8_e4m3fn", "e4m3"}:
+        return torch.float8_e4m3fn
+    if raw in {"fp8_e5m2", "float8_e5m2", "e5m2"}:
+        return torch.float8_e5m2
+    raise ValueError(f"Unsupported SANA_WM_REFINER_KV_CACHE_DTYPE={raw!r}.")
+
+
+def _store_kv_tensor(tensor: torch.Tensor, dtype: torch.dtype | None) -> torch.Tensor:
+    if dtype is None:
+        return tensor
+    return tensor.to(dtype)
+
+
+def _store_kv_pair(
+    pair: tuple[torch.Tensor, torch.Tensor],
+    dtype: torch.dtype | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return (_store_kv_tensor(pair[0], dtype), _store_kv_tensor(pair[1], dtype))
+
+
+def _env_tuple(name: str) -> tuple[str, ...]:
+    raw = os.environ.get(name, "")
+    return tuple(item.strip() for item in raw.split(",") if item.strip())
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").lower() in {"1", "true", "yes", "on"}
+
+
+def _replace_linear_with_te_nvfp4(
+    module: nn.Module,
+    *,
+    recipe,
+    params_dtype: torch.dtype,
+    skip_patterns: tuple[str, ...],
+    prefix: str = "",
+) -> tuple[int, int]:
+    import re
+    import transformer_engine.pytorch as te
+
+    converted = 0
+    skipped = 0
+    for name, child in list(module.named_children()):
+        child_prefix = f"{prefix}.{name}" if prefix else name
+        if any(re.search(pattern, child_prefix) for pattern in skip_patterns):
+            skipped += 1
+            continue
+        if isinstance(child, nn.Linear):
+            if child.in_features % 16 != 0 or child.out_features % 16 != 0:
+                skipped += 1
+                continue
+            old_weight = child.weight.detach()
+            old_bias = child.bias.detach() if child.bias is not None else None
+            ctx = te.fp8_model_init(enabled=True, recipe=recipe)
+            ctx.__enter__()
+            try:
+                replacement = te.Linear(
+                    child.in_features,
+                    child.out_features,
+                    bias=child.bias is not None,
+                    params_dtype=old_weight.dtype if old_weight.dtype in {torch.float16, torch.bfloat16, torch.float32} else params_dtype,
+                    device=str(torch.device("cuda", torch.cuda.current_device())),
+                )
+            finally:
+                ctx.__exit__(None, None, None)
+            replacement.train(child.training)
+            with torch.no_grad():
+                replacement.weight.copy_(old_weight)
+                if old_bias is not None:
+                    replacement.bias.copy_(old_bias)
+            setattr(module, name, replacement)
+            converted += 1
+            continue
+        child_converted, child_skipped = _replace_linear_with_te_nvfp4(
+            child,
+            recipe=recipe,
+            params_dtype=params_dtype,
+            skip_patterns=skip_patterns,
+            prefix=child_prefix,
+        )
+        converted += child_converted
+        skipped += child_skipped
+    return converted, skipped
+
+
+def _offload_video_unused_audio_modules(transformer: nn.Module, device: torch.device | str) -> None:
+    for name in (
+        "audio_proj_in",
+        "audio_caption_projection",
+        "audio_time_embed",
+        "av_cross_attn_video_scale_shift",
+        "av_cross_attn_audio_scale_shift",
+        "av_cross_attn_video_a2v_gate",
+        "av_cross_attn_audio_v2a_gate",
+        "audio_rope",
+        "cross_attn_rope",
+        "cross_attn_audio_rope",
+        "audio_norm_out",
+        "audio_proj_out",
+    ):
+        child = getattr(transformer, name, None)
+        if isinstance(child, nn.Module):
+            child.to(device)
+    for block in getattr(transformer, "transformer_blocks", ()):
+        for name in (
+            "audio_norm1",
+            "audio_attn1",
+            "audio_norm2",
+            "audio_attn2",
+            "audio_to_video_norm",
+            "audio_to_video_attn",
+            "video_to_audio_norm",
+            "video_to_audio_attn",
+            "audio_norm3",
+            "audio_ff",
+        ):
+            child = getattr(block, name, None)
+            if isinstance(child, nn.Module):
+                child.to(device)
+
+
+def _move_ltx2_video_modules_to(transformer: nn.Module, device: torch.device | str) -> None:
+    for name in ("proj_in", "caption_projection", "time_embed", "rope", "norm_out", "proj_out"):
+        child = getattr(transformer, name, None)
+        if isinstance(child, nn.Module):
+            child.to(device)
+    _move_tensor_attr(transformer, "scale_shift_table", device)
+    for block in getattr(transformer, "transformer_blocks", ()):
+        _move_tensor_attr(block, "scale_shift_table", device)
+        for name in ("norm1", "attn1", "norm2", "attn2", "norm3", "ff"):
+            child = getattr(block, name, None)
+            if isinstance(child, nn.Module):
+                child.to(device)
+
+
+def _move_tensor_attr(module: nn.Module, name: str, device: torch.device | str) -> None:
+    value = getattr(module, name, None)
+    if isinstance(value, nn.Parameter):
+        if value.device != torch.device(device):
+            setattr(module, name, nn.Parameter(value.to(device), requires_grad=value.requires_grad))
+    elif isinstance(value, torch.Tensor) and value.device != torch.device(device):
+        setattr(module, name, value.to(device))
 
 
 def _empty_cuda_cache() -> None:
