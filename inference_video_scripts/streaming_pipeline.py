@@ -1,8 +1,13 @@
 """Chunk-pipelined orchestrator for streaming Sana-WM inference.
 
-Drives three CUDA streams (stage-1 DiT, LTX-2 refiner, causal LTX-2 VAE) so
-one chunk is in flight per stage. Every AR chunk produces one decoded video
-chunk, which is written progressively into an MP4 via :class:`StreamingMp4Writer`.
+Drives four CUDA streams so per-chunk work overlaps across stages:
+
+* **stage-1 denoise** — runs the 4-step distilled student forward
+* **stage-1 KV-save**  — the per-chunk KV-cache update; on its own stream so it
+  overlaps with the refiner + decode of the just-finished chunk instead of
+  sitting on stage-1's critical path
+* **refiner**          — LTX-2 chunk-causal refinement with sliding KV window
+* **decode**           — causal LTX-2 VAE, one block at a time
 
 Cadence (canonical recipe ``distilled-4step + source-sink-1``):
 
@@ -15,6 +20,11 @@ Cadence (canonical recipe ``distilled-4step + source-sink-1``):
 
 The pipeline is 1:1 between stages: refiner block ``k`` depends on stage-1
 chunk ``k``; decode chunk ``k`` depends on refiner block ``k``.
+
+The stage-1 iterator MUST have been built with
+``SelfForcingFlowEulerCamCtrl.sample_chunks(..., yield_save_separately=True)``
+so each chunk yields twice: once after denoising (carrying the latent view),
+once after the KV save (a ``None`` sentinel).
 """
 
 from __future__ import annotations
@@ -23,13 +33,28 @@ from collections import deque
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Protocol
 
+import numpy as np
 import torch
 
 from diffusion.model.ltx2 import CausalVaeStreamingDecoder
 from diffusion.refiner.diffusers_ltx2_refiner import RefinerChunkRunner
 from inference_video_scripts.streaming_mp4_writer import StreamingMp4Writer
+
+
+class FrameSink(Protocol):
+    """Anything the orchestrator can hand decoded pixel chunks to.
+
+    ``StreamingMp4Writer`` pipes them into an ffmpeg subprocess; the
+    interactive demo's ``QueueFrameSink`` JPEG-encodes each frame and pushes
+    it into an asyncio queue for a WebSocket sender. ``write_chunk`` accepts
+    ``(T, H, W, 3) uint8`` arrays.
+    """
+
+    def write_chunk(self, frames_uint8: np.ndarray) -> None: ...
+
+    def close(self) -> Path | None: ...
 
 
 @dataclass
@@ -47,7 +72,7 @@ class StreamingPipelineConfig:
 
 @dataclass
 class StreamingPipelineResult:
-    output_path: Path
+    output_path: Path | None
     n_pixel_frames: int
     n_refiner_blocks: int
     n_decode_chunks: int
@@ -56,7 +81,7 @@ class StreamingPipelineResult:
 @torch.inference_mode()
 def run_streaming_inference(
     *,
-    stage1_chunk_iter: Iterator[tuple[int, torch.Tensor, int, int]],
+    stage1_chunk_iter: Iterator[tuple[int, torch.Tensor, int, int] | None],
     n_stage1_chunks: int,
     z_init: torch.Tensor,
     refiner_runner: RefinerChunkRunner,
@@ -64,17 +89,18 @@ def run_streaming_inference(
     pixel_h: int,
     pixel_w: int,
     config: StreamingPipelineConfig,
+    sink: FrameSink | None = None,
     logger=None,
 ) -> StreamingPipelineResult:
-    """Drive the three-stage chunked pipeline end-to-end.
+    """Drive the four-stage chunked pipeline end-to-end.
 
     Args:
-        stage1_chunk_iter: Iterator (typically from
-            ``SelfForcingFlowEulerCamCtrl.sample_chunks``) yielding
-            ``(chunk_idx, latent_view, start_f, end_f)`` after each AR chunk.
-            ``latent_view`` is a view into the sampler's in-place latents
-            tensor; the orchestrator defensively mirror-copies it so the
-            refiner never races with subsequent stage-1 writes.
+        stage1_chunk_iter: Iterator from ``sample_chunks(..., yield_save_separately=True)``.
+            Yields twice per chunk: ``(chunk_idx, latent_view, start_f, end_f)``
+            after denoising, then ``None`` after the KV save pass. ``latent_view``
+            is a stable view into the sampler's in-place latents tensor —
+            subsequent chunks never overwrite earlier frames, so the orchestrator
+            indexes it directly without copying.
         n_stage1_chunks: Number of chunks the iterator will yield.
         z_init: ``(B, C, T_latent, H_lat, W_lat)`` initial latent tensor with
             sink populated at ``[:, :, :sink_size]``.
@@ -111,23 +137,29 @@ def run_streaming_inference(
         f"stage1_chunks={n_stage1_chunks} refiner_blocks={n_refiner} decode_chunks={n_decode}"
     )
 
-    # Pre-allocated mirror buffers. Slices into these are handed across
-    # streams; the storage is long-lived so no record_stream is needed.
-    latents_full = torch.empty_like(z_init)
-    latents_full[:, :, :sink_size] = z_init[:, :, :sink_size]
+    device = z_init.device
+    on_cuda = device.type == "cuda"
+
+    # Stage-1 chunk views (stable across the run — see iterator contract above).
+    latent_chunks: list[torch.Tensor | None] = [None] * n_stage1_chunks
+    sink_seed_view: torch.Tensor | None = None
+
+    # Refined-output mirror buffer; the refiner returns a fresh tensor per call.
     refined_full = torch.empty_like(z_init)
     refined_full[:, :, :sink_size] = z_init[:, :, :sink_size]
 
-    device = z_init.device
-    stage1_stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
-    refiner_stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
-    decode_stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
+    stage1_stream = torch.cuda.Stream(device=device) if on_cuda else None
+    refiner_stream = torch.cuda.Stream(device=device, priority=-1) if on_cuda else None
+    decode_stream = torch.cuda.Stream(device=device, priority=-1) if on_cuda else None
+    # KV-save runs at default priority so refiner / decode preempt it under SM
+    # contention. Next chunk's denoise gates on ``save_events[t-1]``.
+    save_stream = torch.cuda.Stream(device=device, priority=0) if on_cuda else None
 
     def _on(stream):
         return torch.cuda.stream(stream) if stream is not None else nullcontext()
 
     def _new_event():
-        return torch.cuda.Event() if device.type == "cuda" else None
+        return torch.cuda.Event() if on_cuda else None
 
     def _record(event, stream):
         if event is not None and stream is not None:
@@ -138,15 +170,16 @@ def run_streaming_inference(
             stream.wait_event(event)
 
     stage1_events = [_new_event() for _ in range(n_stage1_chunks)]
+    save_events = [_new_event() for _ in range(n_stage1_chunks)]
     refiner_events = [_new_event() for _ in range(n_refiner)]
     decode_events = [_new_event() for _ in range(n_decode)]
 
     vae_streaming_decoder.reset()
 
-    # Pixel chunks awaiting CPU-side ffmpeg writes.
+    # Pixel chunks awaiting CPU-side writes.
     pending: deque[tuple[torch.cuda.Event | None, torch.Tensor, int]] = deque()
 
-    writer = StreamingMp4Writer(
+    writer: FrameSink = sink if sink is not None else StreamingMp4Writer(
         config.output_path,
         height=int(pixel_h),
         width=int(pixel_w),
@@ -157,30 +190,43 @@ def run_streaming_inference(
 
     n_pixel_frames = 0
     try:
-        # Schedule per timestep:
-        #   t=0:  stage1[0]
-        #   t=1:  stage1[1], refiner[0]
-        #   t=2:  stage1[2], refiner[1], decode[0]
-        #   ...
+        # Per timestep: stage1[t], refiner[t-1], decode[t-2].
         n_iters = max(n_stage1_chunks, n_refiner + 1, n_decode + 2)
 
         for t in range(n_iters):
-            # --- stage-1 chunk t ---
+            # --- stage-1 chunk t: denoise + (parallel) KV save ---
             if t < n_stage1_chunks:
+                if t > 0:
+                    _wait(stage1_stream, save_events[t - 1])
                 with _on(stage1_stream):
-                    _, latent_view, start_f, end_f = next(stage1_chunk_iter)
-                    latents_full[:, :, start_f:end_f].copy_(latent_view, non_blocking=True)
+                    _, latent_view, _start_f, _end_f = next(stage1_chunk_iter)
+                    latent_chunks[t] = latent_view
+                    if t == 0:
+                        sink_seed_view = latent_view[:, :, :sink_size]
                 _record(stage1_events[t], stage1_stream)
+                # Resume the generator on ``save_stream`` to run the KV save in
+                # parallel with this chunk's refiner + decode. The yield after
+                # the save is the ``None`` sentinel.
+                _wait(save_stream, stage1_events[t])
+                with _on(save_stream):
+                    next(stage1_chunk_iter)
+                _record(save_events[t], save_stream)
 
-            # --- refiner block t - 1 ---
+            # --- refiner block t-1 ---
             k_ref = t - 1
             if 0 <= k_ref < n_refiner:
                 _wait(refiner_stream, stage1_events[k_ref])
                 block_start = sink_size + k_ref * block_size
                 block_end = block_start + block_size
                 with _on(refiner_stream):
-                    clean_block = latents_full[:, :, block_start:block_end]
-                    sink_seed = latents_full[:, :, :sink_size] if k_ref == 0 else None
+                    # Stage-1 chunk 0 covers ``[0, sink_size + block_size)``;
+                    # split it into sink seed + first active block.
+                    if k_ref == 0:
+                        clean_block = latent_chunks[0][:, :, sink_size:]
+                        sink_seed = sink_seed_view
+                    else:
+                        clean_block = latent_chunks[k_ref]
+                        sink_seed = None
                     refined_block = refiner_runner.refine_block(
                         block_idx=k_ref,
                         clean_block=clean_block,
@@ -191,7 +237,7 @@ def run_streaming_inference(
                     refined_full[:, :, block_start:block_end].copy_(refined_block, non_blocking=True)
                 _record(refiner_events[k_ref], refiner_stream)
 
-            # --- decode chunk t - 2 ---
+            # --- decode chunk t-2 ---
             k_dec = t - 2
             if 0 <= k_dec < n_decode:
                 _wait(decode_stream, refiner_events[k_dec])
@@ -211,7 +257,7 @@ def run_streaming_inference(
                 _record(decode_events[k_dec], decode_stream)
                 pending.append((decode_events[k_dec], pixel_cpu, k_dec))
 
-            # --- Flush any ready decoded chunks to ffmpeg ---
+            # Flush any ready decoded chunks to the sink.
             while pending and (pending[0][0] is None or pending[0][0].query()):
                 _event, _pixel_cpu, _k = pending.popleft()
                 pixel_np = _pixel_cpu.numpy()[0]
@@ -236,8 +282,9 @@ def run_streaming_inference(
         writer.close()
         raise
 
+    out_desc = str(out_path) if out_path is not None else "<sink>"
     log(
-        f"[stream] wrote {n_pixel_frames} pixel frames to {out_path} "
+        f"[stream] wrote {n_pixel_frames} pixel frames to {out_desc} "
         f"(refiner_blocks={n_refiner}, decode_chunks={n_decode})"
     )
     return StreamingPipelineResult(

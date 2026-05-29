@@ -1103,11 +1103,15 @@ class SanaWMPipeline:
         # chunks (chunk 0 absorbs the temporal-stride remainder), so the chunk
         # count is integer-divided here -- NOT ceil-divided.
         n_stage1_chunks = latent_T // params.num_frame_per_block
+        # ``yield_save_separately=True`` lets the orchestrator drive the
+        # per-chunk KV-save pass on its own CUDA stream (overlaps with the
+        # current chunk's refiner + decode).
         stage1_iter = solver.sample_chunks(
             z,
             steps=params.step,
             generator=generator,
             denoising_step_list=params.denoising_step_list,
+            yield_save_separately=True,
         )
 
         # Encode refiner prompt with Gemma. The refiner caches the Gemma weights

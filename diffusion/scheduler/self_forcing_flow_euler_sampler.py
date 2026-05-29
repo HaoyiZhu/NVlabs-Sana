@@ -403,21 +403,29 @@ class SelfForcingFlowEulerCamCtrl(SelfForcingFlowEuler):
         generator: torch.Generator | None = None,
         *,
         denoising_step_list: list[int] | None = None,
+        yield_save_separately: bool = False,
         **kwargs: object,
     ):
         """Streaming variant of :meth:`sample` — yields one chunk at a time.
 
-        After each AR chunk completes (denoising + KV-cache save pass), yields
-        a tuple ``(chunk_idx, latent_chunk_view, start_f, end_f)`` where
-        ``latent_chunk_view`` is a *view* into the in-place-mutated ``latents``
-        tensor for the just-finished chunk. The view stays valid for the
-        remainder of inference (subsequent chunks never overwrite earlier
-        frames), so the orchestrator may launch downstream work on a separate
-        CUDA stream and continue pulling chunks without copying.
+        Yields ``(chunk_idx, latent_chunk_view, start_f, end_f)`` after each
+        chunk's denoise+save pass. ``latent_chunk_view`` is a view into the
+        in-place-mutated ``latents`` tensor and stays valid for the rest of
+        inference (subsequent chunks never overwrite earlier frames), so the
+        orchestrator can hand it across CUDA streams without copying.
 
         ``sample(latents, ...)`` is implemented as ``for _ in sample_chunks(...)``
         and returns ``latents`` after exhaustion, so the legacy whole-volume
         API is preserved.
+
+        With ``yield_save_separately=True`` (used by the streaming orchestrator
+        in :mod:`inference_video_scripts.streaming_pipeline`), the chunk is
+        yielded *before* the KV-save forward and the caller must ``next()``
+        once more to drive the save (yields ``None`` as a sentinel). This lets
+        the save run on its own CUDA stream — overlapping with the current
+        chunk's refiner+decode — so it no longer sits on stage-1's critical
+        path. The refined latents are stable across the gap because nothing
+        else writes to them until the next chunk begins.
         """
         # Resolve scheduler factory once (a fresh instance is built per chunk).
         if denoising_step_list is not None:
@@ -622,6 +630,9 @@ class SelfForcingFlowEulerCamCtrl(SelfForcingFlowEuler):
                 if latents.dtype != latents_dtype:
                     latents = latents.to(latents_dtype)
 
+            if yield_save_separately:
+                yield chunk_idx, latents[:, :, start_f:end_f], start_f, end_f
+
             # KV cache save pass — populates the chunk's clean-sigma K/V for
             # future chunks' self-attention.
             latent_model_input = (
@@ -646,7 +657,10 @@ class SelfForcingFlowEulerCamCtrl(SelfForcingFlowEuler):
             )
             kv_cache[chunk_idx] = updated_kv_cache
 
-            yield chunk_idx, latents[:, :, start_f:end_f], start_f, end_f
+            if yield_save_separately:
+                yield None
+            else:
+                yield chunk_idx, latents[:, :, start_f:end_f], start_f, end_f
 
     # ------------------------------------------------------------------
     # KV cache management

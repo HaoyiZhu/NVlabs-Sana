@@ -10,16 +10,21 @@
 
 """End-to-end streaming SANA-WM inference.
 
-Three-stream chunk-pipelined recipe:
+Four-stream chunk-pipelined recipe:
 
-    * **Stage 1** — chunk-causal distilled student (``SanaMSVideoCamCtrlStreaming``)
-      with self-forcing AR sampling (4 steps, ``cfg_scale=1``).
+    * **Stage-1 denoise** — chunk-causal distilled student
+      (``SanaMSVideoCamCtrlStreaming``) with self-forcing AR sampling
+      (4 steps, ``cfg_scale=1``).
+    * **Stage-1 KV save** — runs on its own CUDA stream so it overlaps with
+      the refiner + decode of the just-finished chunk instead of sitting on
+      stage-1's critical path (bit-exact vs. the legacy single-stream path;
+      see ``tests/sana_wm/test_split_kv_save_equiv.py``).
     * **Refiner** — chunk-causal LTX-2 with a sliding KV window (canonical
       3-step distilled schedule).
     * **VAE** — causal LTX-2 VAE that decodes one block at a time.
 
-Stages run on dedicated CUDA streams; one decoded chunk per AR block is
-appended to a progressive MP4 you can watch while generation continues.
+One decoded chunk per AR block is appended to a progressive MP4 you can
+watch while generation continues.
 
 The script applies the canonical fast configuration by default — no flags
 needed:
@@ -29,7 +34,7 @@ needed:
     * Flash-only SDPA, Inductor ``coordinate_descent_tuning`` + ``epilogue_fusion``,
       cuDNN benchmark, expandable CUDA allocator.
 
-Reaches ~0.93× of realtime in steady-state on a single H100 after the
+Reaches ~0.95× of realtime in steady-state on a single H100 after the
 one-time ``torch.compile`` warmup (~3 min cold, ~30 s warm cache).
 """
 
