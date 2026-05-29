@@ -53,6 +53,7 @@ import imageio.v3 as iio
 import numpy as np
 import pyrallis
 import torch
+import torch.nn as nn
 from PIL import Image
 from torchvision import transforms as T
 
@@ -135,6 +136,10 @@ _STAGE1_NVFP4_INCLUDE_BY_MODE = {
         r"^blocks\.\d+\.attn\.out_proj_cam$",
     ),
     "cross": (r"^blocks\.\d+\.cross_attn\.",),
+    "ffn": (
+        r"^blocks\.\d+\.mlp\.inverted_conv\.linear$",
+        r"^blocks\.\d+\.mlp\.point_conv\.linear$",
+    ),
 }
 
 
@@ -180,6 +185,120 @@ def _stage1_nvfp4_uses_cross_attention() -> bool:
     if any(item.strip() == "cross" for item in mode.replace("+", ",").split(",")):
         return True
     return any("cross_attn" in pattern for pattern in _te_env_tuple("SANA_WM_STAGE1_NVFP4_INCLUDE_PATTERNS"))
+
+
+class _LinearizedPointwiseConv(nn.Module):
+    def __init__(self, conv_layer: nn.Module) -> None:
+        super().__init__()
+        conv = getattr(conv_layer, "conv", None)
+        if not isinstance(conv, nn.Conv2d):
+            raise ValueError("expected ConvLayer.conv to be nn.Conv2d")
+        if conv.kernel_size != (1, 1) or conv.stride != (1, 1) or conv.padding != (0, 0):
+            raise ValueError("only exact 1x1 pointwise Conv2d can be linearized")
+        if conv.dilation != (1, 1) or conv.groups != 1:
+            raise ValueError("grouped or dilated pointwise Conv2d cannot be linearized")
+        if getattr(conv_layer, "dropout", None) is not None or getattr(conv_layer, "norm", None) is not None:
+            raise ValueError("pointwise ConvLayer with dropout/norm is not supported")
+
+        self.linear = nn.Linear(
+            conv.in_channels,
+            conv.out_channels,
+            bias=conv.bias is not None,
+            device=conv.weight.device,
+            dtype=conv.weight.dtype,
+        )
+        with torch.no_grad():
+            self.linear.weight.copy_(conv.weight.flatten(1))
+            if conv.bias is not None:
+                self.linear.bias.copy_(conv.bias)
+        self.act = getattr(conv_layer, "act", None)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.linear(x)
+        if self.act is not None:
+            x = self.act(x)
+        return x
+
+
+class _CachedGLUMBConvTempLinearized(nn.Module):
+    def __init__(self, source: nn.Module) -> None:
+        super().__init__()
+        depth_conv = source.depth_conv
+        depthwise = getattr(depth_conv, "conv", None)
+        if not isinstance(depthwise, nn.Conv2d):
+            raise ValueError("expected depth_conv.conv to be nn.Conv2d")
+
+        self.inverted_conv = _LinearizedPointwiseConv(source.inverted_conv)
+        self.depth_conv = depth_conv
+        self.point_conv = _LinearizedPointwiseConv(source.point_conv)
+        self.t_conv = source.t_conv
+        self.glu_act = source.glu_act
+        self.hidden_features = depthwise.out_channels // 2
+        self.out_feature = self.t_conv.in_channels
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        HW=None,
+        save_kv_cache: bool = False,
+        kv_cache=None,
+        **kwargs,
+    ) -> torch.Tensor:
+        del kwargs
+        B, N, _ = x.shape
+        assert len(HW) == 3, "HW must be a tuple of (T, H, W)"
+        T, H, W = HW
+
+        x = self.inverted_conv(x)
+        x = x.reshape(B * T, H, W, -1).permute(0, 3, 1, 2)
+        x = self.depth_conv(x)
+        x, gate = torch.chunk(x, 2, dim=1)
+        x = x * self.glu_act(gate)
+        x = x.reshape(B * T, self.hidden_features, H * W).permute(0, 2, 1)
+        x = x.reshape(B, N, self.hidden_features)
+        x = self.point_conv(x)
+
+        x_reshaped = x.reshape(B, T, H * W, self.out_feature).permute(0, 3, 1, 2)
+        padding_size = self.t_conv.kernel_size[0] // 2
+        x_t_conv_in = x_reshaped
+        padded_size = 0
+        if kv_cache is not None:
+            if kv_cache[-1] is not None:
+                x_t_conv_in = torch.cat([kv_cache[-1][:, :, -padding_size:], x_reshaped], dim=2)
+                padded_size = x_t_conv_in.shape[2] - x_reshaped.shape[2]
+            if save_kv_cache:
+                kv_cache[-1] = x_reshaped[:, :, -padding_size:, :].detach().clone()
+
+        t_conv_out = self.t_conv(x_t_conv_in)[:, :, padded_size:]
+        x_out = x_reshaped + t_conv_out
+        x_out = x_out.permute(0, 2, 3, 1).reshape(B, N, self.out_feature)
+
+        if kv_cache is not None:
+            return x_out, kv_cache
+        return x_out
+
+
+def _linearize_stage1_ffn_for_nvfp4(module: nn.Module, *, prefix: str = "") -> tuple[int, int]:
+    from diffusion.model.nets.basic_modules import CachedGLUMBConvTemp
+
+    converted = 0
+    skipped = 0
+    for name, child in list(module.named_children()):
+        child_prefix = f"{prefix}.{name}" if prefix else name
+        if isinstance(child, CachedGLUMBConvTemp):
+            try:
+                replacement = _CachedGLUMBConvTempLinearized(child)
+            except ValueError:
+                skipped += 1
+                continue
+            replacement.train(child.training)
+            setattr(module, name, replacement)
+            converted += 1
+            continue
+        child_converted, child_skipped = _linearize_stage1_ffn_for_nvfp4(child, prefix=child_prefix)
+        converted += child_converted
+        skipped += child_skipped
+    return converted, skipped
 
 # Action-string rollout defaults. Rotation is intentionally slower than
 # translation so casual WASD+IJKL strings produce natural trajectories.
@@ -700,6 +819,25 @@ class SanaWMPipeline:
         model = getattr(self, "model", None)
         if model is None or getattr(model, "_sana_wm_stage1_nvfp4_converted", False):
             return
+
+        if _te_env_flag("SANA_WM_STAGE1_LINEARIZE_FFN") and not getattr(
+            model, "_sana_wm_stage1_ffn_linearized", False
+        ):
+            converted_ffn, skipped_ffn = _linearize_stage1_ffn_for_nvfp4(model)
+            if converted_ffn <= 0:
+                raise RuntimeError(
+                    "SANA_WM_STAGE1_LINEARIZE_FFN=1 converted no CachedGLUMBConvTemp blocks; "
+                    f"skipped={skipped_ffn}."
+                )
+            model._sana_wm_stage1_ffn_linearized = True
+            self.logger.info(
+                "[Stage-1 linearized FFN] converted %d CachedGLUMBConvTemp blocks, skipped %d",
+                converted_ffn,
+                skipped_ffn,
+            )
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         import transformer_engine.common.recipe as te_recipe
         import transformer_engine.pytorch as te
@@ -1293,9 +1431,36 @@ class SanaWMPipeline:
             vae_stride=vae_stride,
         )
 
+        # Encode the refiner prompt before allocating resident Stage-1 tensors.
+        # On 32GB cards Gemma's temporary activations can otherwise collide with
+        # latents/raymaps even after the large model modules are offloaded.
+        refiner_prompt_embeds, refiner_prompt_attention_mask = self._get_streaming_refiner_prompt(prompt)
+        if _te_env_flag("SANA_WM_REFINER_NVFP4"):
+            cpu_stage_nvfp4 = _te_env_flag("SANA_WM_TE_NVFP4_CPU_STAGING")
+            offload_stage1_for_refiner_nvfp4 = (
+                (not cpu_stage_nvfp4) and _te_env_flag("SANA_WM_REFINER_NVFP4_OFFLOAD_STAGE1")
+            )
+            offload_vae_for_refiner_nvfp4 = (
+                (not cpu_stage_nvfp4) and _te_env_flag("SANA_WM_REFINER_NVFP4_OFFLOAD_VAE")
+            )
+            if offload_stage1_for_refiner_nvfp4:
+                self.model.to("cpu")
+                torch.cuda.empty_cache()
+            if offload_vae_for_refiner_nvfp4:
+                self.vae.to("cpu")
+                torch.cuda.empty_cache()
+            if not cpu_stage_nvfp4:
+                self.refiner.move_video_modules(self.device)
+            self.refiner.offload_video_unused_audio_modules("cpu")
+            self.refiner.prepare_transformer_nvfp4()
+            if cpu_stage_nvfp4:
+                self.refiner.move_video_modules(self.device)
+                self.refiner.offload_video_unused_audio_modules("cpu")
+            torch.cuda.empty_cache()
+
         # First-frame encode (uses self.vae, which is the causal LTX-2 VAE in
         # streaming mode — same encoder as the bidirectional sibling).
-        if self.offload_vae:
+        if self.offload_vae or _te_env_flag("SANA_WM_REFINER_NVFP4_OFFLOAD_VAE"):
             self.vae.to(self.device)
         img = (T.ToTensor()(image) * 2.0 - 1.0).unsqueeze(0).unsqueeze(2)
         first_latent = vae_encode(
@@ -1307,6 +1472,11 @@ class SanaWMPipeline:
         if self.offload_vae:
             self.vae.to("cpu")
             torch.cuda.empty_cache()
+        else:
+            # The encoder is no longer needed after the conditioning frame is
+            # latent-encoded. Move it out before refiner NVFP4 conversion, where
+            # 32GB cards are sensitive to temporary TE allocation peaks.
+            self._offload_vae_encoder_for_streaming()
 
         cond, cond_mask, neg, neg_mask = self._get_streaming_stage1_prompt(prompt, params.negative_prompt)
         raymap = camera["raymap"].unsqueeze(0).to(self.device, dtype=self.weight_dtype)
@@ -1368,10 +1538,6 @@ class SanaWMPipeline:
             denoising_step_list=params.denoising_step_list,
         )
 
-        # Encode the refiner prompt with Gemma before the timed streaming loop.
-        # Repeated streaming runs reuse the small connector output and avoid
-        # moving Gemma onto the 32GB card again.
-        refiner_prompt_embeds, refiner_prompt_attention_mask = self._get_streaming_refiner_prompt(prompt)
         self.refiner.move_video_modules(self.device)
         self.refiner.offload_video_unused_audio_modules("cpu")
         self.refiner.prepare_transformer_nvfp4()
@@ -1395,7 +1561,6 @@ class SanaWMPipeline:
             self._move_vae_decoder_for_streaming("cpu")
         else:
             self._move_vae_decoder_for_streaming(self.device)
-        self._offload_vae_encoder_for_streaming()
 
         def _offload_stage1_after_streaming_sample() -> None:
             self.model.to("cpu")

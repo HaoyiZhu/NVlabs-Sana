@@ -476,6 +476,7 @@ class DiffusersLTX2Refiner(nn.Module):
                 encoder_attention_mask=prompt_attention_mask,
                 video_rotary_emb=video_rotary_emb,
                 n_context_tokens=0,
+                skip_output_projection=True,
             )
         finally:
             _set_capture_flag_on_blocks(self.transformer, capture_mode, enable=False)
@@ -513,6 +514,9 @@ class DiffusersLTX2Refiner(nn.Module):
         outputs = text_backbone(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
         hidden_states = torch.stack(outputs.hidden_states, dim=-1)
         sequence_lengths = attention_mask.sum(dim=-1)
+        del text_encoder, text_backbone, outputs
+        _empty_cuda_cache()
+
         prompt_embeds = _pack_text_embeds(
             hidden_states,
             sequence_lengths,
@@ -520,7 +524,7 @@ class DiffusersLTX2Refiner(nn.Module):
             padding_side=tokenizer.padding_side,
         ).to(dtype=self.dtype)
 
-        del text_encoder, text_backbone, outputs, hidden_states
+        del hidden_states
         _empty_cuda_cache()
 
         self.connectors.to(self.device)
@@ -583,6 +587,7 @@ class DiffusersLTX2Refiner(nn.Module):
         encoder_attention_mask: torch.Tensor | None,
         video_rotary_emb: tuple[torch.Tensor, torch.Tensor],
         n_context_tokens: int,
+        skip_output_projection: bool = False,
     ) -> torch.Tensor:
         """Shared body of ``_forward_video_only`` that takes a pre-built RoPE.
 
@@ -620,6 +625,9 @@ class DiffusersLTX2Refiner(nn.Module):
                     encoder_attention_mask=encoder_attention_mask,
                     n_context_tokens=n_context_tokens,
                 )
+
+        if skip_output_projection:
+            return hidden_states
 
         scale_shift_values = transformer.scale_shift_table[None, None] + embedded_timestep[:, :, None]
         shift, scale = scale_shift_values[:, :, 0], scale_shift_values[:, :, 1]
@@ -847,6 +855,7 @@ class RefinerChunkRunner:
         )
         kv_prefix_per_layer: list[dict[str, object]] = []
         preconcat_prefix = _env_flag("SANA_WM_REFINER_PRECONCAT_PREFIX")
+        empty_cache_before_prefix = _env_flag("SANA_WM_REFINER_EMPTY_CACHE_BEFORE_PREFIX")
         for layer_idx in range(self._n_layers):
             hk = self._history_kv_post[layer_idx]
             prefix: dict[str, object] = {
@@ -870,6 +879,8 @@ class RefinerChunkRunner:
                     prefix_k_parts.append(hk[0].to(self._dtype))
                     prefix_v_parts.append(hk[1].to(self._dtype))
                 if prefix_k_parts:
+                    if empty_cache_before_prefix and device.type == "cuda":
+                        torch.cuda.empty_cache()
                     prefix_k = torch.cat(prefix_k_parts, dim=1)
                     prefix_v = torch.cat(prefix_v_parts, dim=1)
                     prefix["prefix_k"] = prefix_k
@@ -890,12 +901,8 @@ class RefinerChunkRunner:
             device=device,
             fps=self._fps,
         )
-        fast_kv_capture = _refiner_fast_kv_capture_mode()
-        reuse_final_predict_kv = fast_kv_capture == "last_predict"
-        captured_kv_post: list[tuple[torch.Tensor, torch.Tensor]] | None = None
-        n_sigma_pairs = len(self._sigma_pairs)
-        for step_idx, (sigma_cur, sigma_next) in enumerate(self._sigma_pairs):
-            pred_result = refiner._predict_x0_active_block(
+        for sigma_cur, sigma_next in self._sigma_pairs:
+            pred_x0 = refiner._predict_x0_active_block(
                 active=x_t,
                 active_positions=active_positions,
                 sigma_cur=sigma_cur,
@@ -904,37 +911,31 @@ class RefinerChunkRunner:
                 fps=self._fps,
                 kv_prefix_per_layer=kv_prefix_per_layer,
                 active_video_rotary_emb=active_video_rotary_emb,
-                capture_post_kv=bool(reuse_final_predict_kv and step_idx == n_sigma_pairs - 1),
             )
-            if isinstance(pred_result, tuple):
-                pred_x0, captured_kv_post = pred_result
-            else:
-                pred_x0 = pred_result
             if sigma_cur <= 1.0e-6:
                 x_t = pred_x0.to(self._dtype)
             else:
                 ratio = sigma_next / sigma_cur
                 x_t = (ratio * x_t.float() + (1.0 - ratio) * pred_x0.float()).to(self._dtype)
+            pred_x0 = None
 
         # 4) Capture POST-RoPE K/V for this refined block under the same prefix.
-        if reuse_final_predict_kv:
-            if captured_kv_post is None:
-                raise RuntimeError("SANA_WM_REFINER_FAST_KV_CAPTURE=last_predict did not capture post-RoPE K/V.")
-            block_kv_post = captured_kv_post
-        else:
-            block_kv_post = refiner._capture_block_kv(
-                clean_block=x_t,
-                frame_positions=active_positions,
-                prompt_embeds=self._prompt_embeds,
-                prompt_attention_mask=self._prompt_attention_mask,
-                fps=self._fps,
-                capture_mode="post_rope",
-                kv_prefix_per_layer=kv_prefix_per_layer,
-            )
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        block_kv_post = refiner._capture_block_kv(
+            clean_block=x_t,
+            frame_positions=active_positions,
+            prompt_embeds=self._prompt_embeds,
+            prompt_attention_mask=self._prompt_attention_mask,
+            fps=self._fps,
+            capture_mode="post_rope",
+            kv_prefix_per_layer=kv_prefix_per_layer,
+        )
         for layer_idx in range(self._n_layers):
-            new_k, new_v = block_kv_post[layer_idx]
-            new_k = _store_kv_tensor(new_k, self._kv_cache_storage_dtype)
-            new_v = _store_kv_tensor(new_v, self._kv_cache_storage_dtype)
+            raw_k, raw_v = block_kv_post[layer_idx]
+            new_k = _store_kv_tensor(raw_k, self._kv_cache_storage_dtype)
+            new_v = _store_kv_tensor(raw_v, self._kv_cache_storage_dtype)
+            block_kv_post[layer_idx] = (new_k, new_v)
             old = self._history_kv_post[layer_idx]
             if old is None:
                 if self._max_history_frames > 0 and active_len > self._max_history_frames:
@@ -954,6 +955,8 @@ class RefinerChunkRunner:
                     torch.cat([old[0], new_k], dim=1),
                     torch.cat([old[1], new_v], dim=1),
                 )
+            raw_k = None
+            raw_v = None
         self._history_frames += active_len
 
         if self._max_history_frames > 0 and self._history_frames > self._max_history_frames:
@@ -1509,16 +1512,6 @@ def _resolve_kv_cache_storage_dtype() -> torch.dtype | None:
     raise ValueError(f"Unsupported SANA_WM_REFINER_KV_CACHE_DTYPE={raw!r}.")
 
 
-def _refiner_fast_kv_capture_mode() -> str:
-    raw = os.environ.get("SANA_WM_REFINER_FAST_KV_CAPTURE", "").strip().lower()
-    if not raw or raw in {"clean", "exact", "off", "0"}:
-        return "clean"
-    # Reuses K/V from the final denoise prediction, so history is approximate.
-    if raw in {"last_predict", "reuse_last_predict", "final_predict"}:
-        return "last_predict"
-    raise ValueError(f"Unsupported SANA_WM_REFINER_FAST_KV_CAPTURE={raw!r}.")
-
-
 def _store_kv_tensor(tensor: torch.Tensor, dtype: torch.dtype | None) -> torch.Tensor:
     if dtype is None:
         return tensor
@@ -1569,25 +1562,48 @@ def _replace_linear_with_te_nvfp4(
             if child.in_features % 16 != 0 or child.out_features % 16 != 0:
                 skipped += 1
                 continue
-            old_weight = child.weight.detach()
-            old_bias = child.bias.detach() if child.bias is not None else None
-            ctx = te.fp8_model_init(enabled=True, recipe=recipe)
-            ctx.__enter__()
+            use_cpu_staging = _env_flag("SANA_WM_TE_NVFP4_CPU_STAGING")
+            child_training = child.training
+            has_bias = child.bias is not None
+            params_dtype_for_replacement = (
+                child.weight.dtype
+                if child.weight.dtype in {torch.float16, torch.bfloat16, torch.float32}
+                else params_dtype
+            )
+            if use_cpu_staging:
+                old_weight = child.weight.detach().to("cpu", copy=True)
+                old_bias = child.bias.detach().to("cpu", copy=True) if child.bias is not None else None
+                setattr(module, name, nn.Identity())
+                del child
+                gc.collect()
+                _empty_cuda_cache()
+            else:
+                old_weight = child.weight.detach()
+                old_bias = child.bias.detach() if child.bias is not None else None
             try:
+                ctx = te.fp8_model_init(
+                    enabled=True,
+                    recipe=recipe,
+                    preserve_high_precision_init_val=False,
+                )
+            except TypeError:
+                ctx = te.fp8_model_init(enabled=True, recipe=recipe)
+            with ctx:
                 replacement = te.Linear(
-                    child.in_features,
-                    child.out_features,
-                    bias=child.bias is not None,
-                    params_dtype=old_weight.dtype if old_weight.dtype in {torch.float16, torch.bfloat16, torch.float32} else params_dtype,
+                    old_weight.shape[1],
+                    old_weight.shape[0],
+                    bias=has_bias,
+                    params_dtype=params_dtype_for_replacement,
                     device=str(torch.device("cuda", torch.cuda.current_device())),
                 )
-            finally:
-                ctx.__exit__(None, None, None)
-            replacement.train(child.training)
+            replacement.train(child_training)
             with torch.no_grad():
-                replacement.weight.copy_(old_weight)
+                replacement.weight.copy_(old_weight.to(device=replacement.weight.device))
                 if old_bias is not None:
-                    replacement.bias.copy_(old_bias)
+                    replacement.bias.copy_(old_bias.to(device=replacement.bias.device))
+            if use_cpu_staging:
+                del old_weight, old_bias
+                _empty_cuda_cache()
             setattr(module, name, replacement)
             converted += 1
             continue
