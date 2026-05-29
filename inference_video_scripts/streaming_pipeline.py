@@ -24,7 +24,6 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterator
-import os
 import time
 
 import numpy as np
@@ -165,14 +164,6 @@ def run_streaming_inference(
         f"stage1_chunks={n_stage1_chunks} refiner_blocks={n_refiner} "
         f"decode_chunks={n_decode} output_mode={output_mode}"
     )
-    early_decode = os.environ.get("SANA_WM_STREAMING_EARLY_DECODE", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-    if early_decode:
-        log("[stream] early_decode=1: enqueue VAE decode as soon as its refiner block is queued")
     if bool(config.sequential_offload):
         return _run_streaming_inference_sequential(
             stage1_chunk_iter=stage1_chunk_iter,
@@ -316,12 +307,8 @@ def run_streaming_inference(
                 _record(refiner_events[k_ref], refiner_stream)
                 next_ref += 1
 
-            # --- decode chunk ---
-            # The decode stream waits on the refiner event, so it is safe to
-            # enqueue immediately after the matching refiner block is queued.
-            # Keep the historical one-loop delay unless explicitly enabled.
-            decode_ready_ref = next_ref if early_decode else refiner_launched_before
-            if next_dec < n_decode and next_dec < decode_ready_ref:
+            # --- decode chunk t - 2 ---
+            if next_dec < n_decode and next_dec < refiner_launched_before:
                 k_dec = next_dec
                 _wait(decode_stream, refiner_events[k_dec])
                 if k_dec == 0:
