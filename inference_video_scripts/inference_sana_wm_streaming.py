@@ -382,6 +382,15 @@ def main() -> None:
                 "FUSED_GDN_PRECISION",
                 "PRECISION_OVERRIDE",
                 "PYTORCH_CUDA_ALLOC_CONF",
+                "SANA_WM_STREAMING_PROMPT_CACHE",
+                "SANA_WM_STAGE1_NVFP4",
+                "SANA_WM_STAGE1_NVFP4_MODE",
+                "SANA_WM_STAGE1_NVFP4_TEXT_PAD_MULTIPLE",
+                "SANA_WM_STAGE1_KV_SAVE_STRIDE",
+                "SANA_WM_REFINER_NVFP4",
+                "SANA_WM_REFINER_ATTN_BACKEND",
+                "SANA_WM_REFINER_KV_CACHE_DTYPE",
+                "SANA_WM_STREAMING_LAZY_VAE_DECODER",
             )
             if os.environ.get(name) is not None
         }

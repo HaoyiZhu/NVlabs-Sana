@@ -631,6 +631,10 @@ class SanaWMPipeline:
         self.weight_dtype = get_weight_dtype(config.model.mixed_precision)
         self.vae_dtype = get_weight_dtype(config.vae.weight_dtype)
         self._refiner_built = False
+        self._streaming_stage1_prompt_cache: dict[
+            tuple[object, ...], tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = {}
+        self._streaming_refiner_prompt_cache: dict[tuple[object, ...], tuple[torch.Tensor, torch.Tensor]] = {}
 
         self._build_vae()
         self._build_text_encoder()
@@ -932,6 +936,63 @@ class SanaWMPipeline:
         cond, cond_mask = pad_pair(cond, cond_mask)
         neg, neg_mask = pad_pair(neg, neg_mask)
         return cond, cond_mask, neg, neg_mask
+
+    def _streaming_prompt_cache_enabled(self) -> bool:
+        return os.environ.get("SANA_WM_STREAMING_PROMPT_CACHE", "1").lower() in _ENV_TRUE
+
+    def _get_streaming_stage1_prompt(
+        self, prompt: str, negative_prompt: str
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        key = (
+            prompt,
+            negative_prompt,
+            str(self.device),
+            str(self.weight_dtype),
+            _stage1_nvfp4_mode(),
+            os.environ.get("SANA_WM_STAGE1_NVFP4_TEXT_PAD_MULTIPLE", "8"),
+        )
+        cache = self._streaming_stage1_prompt_cache
+        if self._streaming_prompt_cache_enabled() and key in cache:
+            return cache[key]
+
+        cond, cond_mask, neg, neg_mask = self._encode_prompts(prompt, negative_prompt)
+        cond, cond_mask, neg, neg_mask = self._pad_stage1_text_for_nvfp4(cond, cond_mask, neg, neg_mask)
+        if self._streaming_prompt_cache_enabled():
+            cache.clear()
+            cache[key] = (
+                cond.detach(),
+                cond_mask.detach(),
+                neg.detach(),
+                neg_mask.detach(),
+            )
+        return cond, cond_mask, neg, neg_mask
+
+    def _get_streaming_refiner_prompt(self, prompt: str) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.refiner is None:
+            raise RuntimeError("Streaming refiner prompt requested before the refiner is built.")
+        key = (
+            prompt.strip(),
+            str(self.device),
+            str(self.refiner.dtype),
+            str(self.refiner.refiner_root),
+            str(self.refiner.gemma_root),
+            int(self.refiner.text_max_sequence_length),
+        )
+        cache = self._streaming_refiner_prompt_cache
+        if self._streaming_prompt_cache_enabled() and key in cache:
+            return cache[key]
+
+        # A 32GB 5090 cannot hold Gemma plus the resident DiT/VAE/refiner stack,
+        # so temporarily spill the generation models while the prompt is encoded.
+        self.model.to("cpu")
+        self._move_vae_decoder_for_streaming("cpu")
+        self.refiner.move_video_modules("cpu")
+        torch.cuda.empty_cache()
+        embeds, attention_mask = self.refiner._encode_prompt(prompt)
+        if self._streaming_prompt_cache_enabled():
+            cache.clear()
+            cache[key] = (embeds.detach(), attention_mask.detach())
+        return embeds, attention_mask
 
     def _sample_stage1(
         self,
@@ -1247,8 +1308,7 @@ class SanaWMPipeline:
             self.vae.to("cpu")
             torch.cuda.empty_cache()
 
-        cond, cond_mask, neg, neg_mask = self._encode_prompts(prompt, params.negative_prompt)
-        cond, cond_mask, neg, neg_mask = self._pad_stage1_text_for_nvfp4(cond, cond_mask, neg, neg_mask)
+        cond, cond_mask, neg, neg_mask = self._get_streaming_stage1_prompt(prompt, params.negative_prompt)
         raymap = camera["raymap"].unsqueeze(0).to(self.device, dtype=self.weight_dtype)
         chunk_plucker = camera["chunk_plucker"].unsqueeze(0).to(self.device, dtype=self.weight_dtype)
         if params.cfg_scale > 1.0:
@@ -1309,13 +1369,9 @@ class SanaWMPipeline:
         )
 
         # Encode the refiner prompt with Gemma before the timed streaming loop.
-        # A 32GB 5090 cannot hold Gemma plus the resident DiT/VAE/refiner stack,
-        # so temporarily spill the generation models while the prompt is encoded.
-        self.model.to("cpu")
-        self._move_vae_decoder_for_streaming("cpu")
-        self.refiner.move_video_modules("cpu")
-        torch.cuda.empty_cache()
-        refiner_prompt_embeds, refiner_prompt_attention_mask = self.refiner._encode_prompt(prompt)
+        # Repeated streaming runs reuse the small connector output and avoid
+        # moving Gemma onto the 32GB card again.
+        refiner_prompt_embeds, refiner_prompt_attention_mask = self._get_streaming_refiner_prompt(prompt)
         self.refiner.move_video_modules(self.device)
         self.refiner.offload_video_unused_audio_modules("cpu")
         self.refiner.prepare_transformer_nvfp4()
