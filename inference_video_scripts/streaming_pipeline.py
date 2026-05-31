@@ -60,6 +60,7 @@ class StreamingPipelineConfig:
     stage1_done_callback: Callable[[], None] | None = None
     stage1_chunk_ends: tuple[int, ...] | None = None
     decoded_chunk_callback: Callable[[np.ndarray, int, int], None] | None = None
+    progress_callback: Callable[[dict[str, object]], None] | None = None
 
 
 @dataclass
@@ -171,6 +172,21 @@ def run_streaming_inference(
         f"stage1_chunks={n_stage1_chunks} refiner_blocks={n_refiner} "
         f"decode_chunks={n_decode} output_mode={output_mode}"
     )
+    if config.progress_callback is not None:
+        config.progress_callback(
+            {
+                "phase": "stream_start",
+                "message": "streaming pipeline started",
+                "stage1_done": 0,
+                "stage1_total": n_stage1_chunks,
+                "refiner_done": 0,
+                "refiner_total": n_refiner,
+                "decode_done": 0,
+                "decode_total": n_decode,
+                "frames": 0,
+                "output_mode": output_mode,
+            }
+        )
     if bool(config.sequential_offload):
         return _run_streaming_inference_sequential(
             stage1_chunk_iter=stage1_chunk_iter,
@@ -372,6 +388,19 @@ def run_streaming_inference(
                     refiner_timing_events.append((timing_start, timing_end))
             _record(refiner_events[k_ref], refiner_stream)
             next_ref += 1
+            if config.progress_callback is not None:
+                config.progress_callback(
+                    {
+                        "phase": "refiner",
+                        "message": f"refiner block {next_ref}/{n_refiner}",
+                        "refiner_done": next_ref,
+                        "refiner_total": n_refiner,
+                        "decode_done": next_dec,
+                        "decode_total": n_decode,
+                        "frames": n_pixel_frames,
+                        "output_mode": output_mode,
+                    }
+                )
             return True
 
         def _try_launch_decode(max_refiner_idx_exclusive: int) -> bool:
@@ -440,6 +469,21 @@ def run_streaming_inference(
                     if timing_start is not None and timing_end is not None:
                         stage1_timing_events.append((timing_start, timing_end))
                 _record(stage1_events[t], stage1_stream)
+                if config.progress_callback is not None:
+                    config.progress_callback(
+                        {
+                            "phase": "stage1",
+                            "message": f"stage-1 chunk {t + 1}/{n_stage1_chunks}",
+                            "stage1_done": t + 1,
+                            "stage1_total": n_stage1_chunks,
+                            "refiner_done": next_ref,
+                            "refiner_total": n_refiner,
+                            "decode_done": next_dec,
+                            "decode_total": n_decode,
+                            "frames": n_pixel_frames,
+                            "output_mode": output_mode,
+                        }
+                    )
 
             # --- refiner block t - 1 ---
             if not refiner_first or refiner_launched_before == next_ref:
@@ -472,6 +516,17 @@ def run_streaming_inference(
                 n_pixel_frames += n_frames
                 if first_chunk_frames is None:
                     first_chunk_frames = n_frames
+                if config.progress_callback is not None:
+                    config.progress_callback(
+                        {
+                            "phase": "decode",
+                            "message": f"decoded chunk {int(_k) + 1}/{n_decode}",
+                            "decode_done": int(_k) + 1,
+                            "decode_total": n_decode,
+                            "frames": n_pixel_frames,
+                            "output_mode": output_mode,
+                        }
+                    )
             t += 1
 
         # Drain.
@@ -498,7 +553,29 @@ def run_streaming_inference(
             n_pixel_frames += n_frames
             if first_chunk_frames is None:
                 first_chunk_frames = n_frames
+            if config.progress_callback is not None:
+                config.progress_callback(
+                    {
+                        "phase": "decode",
+                        "message": f"decoded chunk {int(_k) + 1}/{n_decode}",
+                        "decode_done": int(_k) + 1,
+                        "decode_total": n_decode,
+                        "frames": n_pixel_frames,
+                        "output_mode": output_mode,
+                    }
+                )
 
+        if config.progress_callback is not None:
+            config.progress_callback(
+                {
+                    "phase": "finalize",
+                    "message": "finalizing MP4" if output_mode == "mp4" else "finalizing preview stream",
+                    "decode_done": n_decode,
+                    "decode_total": n_decode,
+                    "frames": n_pixel_frames,
+                    "output_mode": output_mode,
+                }
+            )
         out_path = writer.close() if writer is not None else None
         if sample_frames_path is not None:
             sample_frames_path.parent.mkdir(parents=True, exist_ok=True)
@@ -601,6 +678,21 @@ def _run_streaming_inference_sequential(
     device = z_init.device
 
     log("[stream] sequential_offload=1: stage1 -> offload -> refiner -> decode")
+    if config.progress_callback is not None:
+        config.progress_callback(
+            {
+                "phase": "stream_start",
+                "message": "sequential streaming pipeline started",
+                "stage1_done": 0,
+                "stage1_total": n_stage1_chunks,
+                "refiner_done": 0,
+                "refiner_total": n_refiner,
+                "decode_done": 0,
+                "decode_total": n_decode,
+                "frames": 0,
+                "output_mode": output_mode,
+            }
+        )
 
     latents_full = torch.empty_like(z_init)
     latents_full[:, :, :sink_size] = z_init[:, :, :sink_size]
@@ -661,8 +753,19 @@ def _run_streaming_inference_sequential(
     out_path: Path | None = None
     try:
         for _ in range(n_stage1_chunks):
-            _, latent_view, start_f, end_f = next(stage1_chunk_iter)
+            chunk_idx, latent_view, start_f, end_f = next(stage1_chunk_iter)
             latents_full[:, :, start_f:end_f].copy_(latent_view, non_blocking=True)
+            if config.progress_callback is not None:
+                config.progress_callback(
+                    {
+                        "phase": "stage1",
+                        "message": f"stage-1 chunk {int(chunk_idx) + 1}/{n_stage1_chunks}",
+                        "stage1_done": int(chunk_idx) + 1,
+                        "stage1_total": n_stage1_chunks,
+                        "frames": n_pixel_frames,
+                        "output_mode": output_mode,
+                    }
+                )
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         stage1_seconds = time.perf_counter() - stage1_t0
@@ -688,6 +791,17 @@ def _run_streaming_inference_sequential(
                 sink_seed_frames=sink_seed,
             )
             refined_full[:, :, block_start:block_end].copy_(refined_block, non_blocking=True)
+            if config.progress_callback is not None:
+                config.progress_callback(
+                    {
+                        "phase": "refiner",
+                        "message": f"refiner block {k_ref + 1}/{n_refiner}",
+                        "refiner_done": k_ref + 1,
+                        "refiner_total": n_refiner,
+                        "frames": n_pixel_frames,
+                        "output_mode": output_mode,
+                    }
+                )
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         refiner_seconds = time.perf_counter() - refiner_t0
@@ -732,10 +846,32 @@ def _run_streaming_inference_sequential(
                 first_chunk_seconds = time.perf_counter() - t_start
                 first_chunk_frames = n_frames
             n_pixel_frames += max(0, n_frames)
+            if config.progress_callback is not None:
+                config.progress_callback(
+                    {
+                        "phase": "decode",
+                        "message": f"decoded chunk {k_dec + 1}/{n_decode}",
+                        "decode_done": k_dec + 1,
+                        "decode_total": n_decode,
+                        "frames": n_pixel_frames,
+                        "output_mode": output_mode,
+                    }
+                )
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         decode_seconds = time.perf_counter() - decode_t0
 
+        if config.progress_callback is not None:
+            config.progress_callback(
+                {
+                    "phase": "finalize",
+                    "message": "finalizing MP4" if output_mode == "mp4" else "finalizing preview stream",
+                    "decode_done": n_decode,
+                    "decode_total": n_decode,
+                    "frames": n_pixel_frames,
+                    "output_mode": output_mode,
+                }
+            )
         out_path = writer.close() if writer is not None else None
         if sample_frames_path is not None:
             sample_frames_path.parent.mkdir(parents=True, exist_ok=True)

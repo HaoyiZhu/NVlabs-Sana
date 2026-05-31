@@ -42,7 +42,7 @@ import time
 import types
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Callable, Literal
 
 # xformers' memory_efficient_attention interacts badly with our cross-attention
 # mask path on torch 2.9 + xformers 0.0.33; fall back to PyTorch SDPA, which is
@@ -1400,6 +1400,7 @@ class SanaWMPipeline:
         sample_frames_path: str | Path | None = None,
         sample_frame_stride: int = 0,
         decoded_chunk_callback=None,
+        progress_callback: Callable[[dict[str, object]], None] | None = None,
     ) -> dict[str, object]:
         """Chunk-pipelined interactive generation.
 
@@ -1445,11 +1446,16 @@ class SanaWMPipeline:
             # in/out per chunk would dominate runtime.
             self._build_refiner()
 
+        def _progress(message: str, phase: str = "prepare", **extra: object) -> None:
+            if progress_callback is not None:
+                progress_callback({"phase": phase, "message": message, **extra})
+
         vae_stride = self.config.vae.vae_stride
         latent_T = (params.num_frames - 1) // vae_stride[0] + 1
         latent_h = TARGET_HEIGHT // vae_stride[-1]
         latent_w = TARGET_WIDTH // vae_stride[-1]
 
+        _progress("preparing camera conditioning")
         camera = prepare_camera(
             c2w[: params.num_frames],
             intrinsics_vec4[: params.num_frames],
@@ -1460,8 +1466,10 @@ class SanaWMPipeline:
         # Encode the refiner prompt before allocating resident Stage-1 tensors.
         # On 32GB cards Gemma's temporary activations can otherwise collide with
         # latents/raymaps even after the large model modules are offloaded.
+        _progress("encoding refiner prompt")
         refiner_prompt_embeds, refiner_prompt_attention_mask = self._get_streaming_refiner_prompt(prompt)
         if _te_env_flag("SANA_WM_REFINER_NVFP4"):
+            _progress("preparing refiner NVFP4")
             cpu_stage_nvfp4 = _te_env_flag("SANA_WM_TE_NVFP4_CPU_STAGING")
             offload_stage1_for_refiner_nvfp4 = (
                 (not cpu_stage_nvfp4) and _te_env_flag("SANA_WM_REFINER_NVFP4_OFFLOAD_STAGE1")
@@ -1486,6 +1494,7 @@ class SanaWMPipeline:
 
         # First-frame encode (uses self.vae, which is the causal LTX-2 VAE in
         # streaming mode — same encoder as the bidirectional sibling).
+        _progress("encoding first frame")
         if self.offload_vae or _te_env_flag("SANA_WM_REFINER_NVFP4_OFFLOAD_VAE"):
             self.vae.to(self.device)
         img = (T.ToTensor()(image) * 2.0 - 1.0).unsqueeze(0).unsqueeze(2)
@@ -1504,7 +1513,9 @@ class SanaWMPipeline:
             # 32GB cards are sensitive to temporary TE allocation peaks.
             self._offload_vae_encoder_for_streaming()
 
+        _progress("encoding stage-1 prompt")
         cond, cond_mask, neg, neg_mask = self._get_streaming_stage1_prompt(prompt, params.negative_prompt)
+        _progress("allocating latent buffers")
         raymap = camera["raymap"].unsqueeze(0).to(self.device, dtype=self.weight_dtype)
         chunk_plucker = camera["chunk_plucker"].unsqueeze(0).to(self.device, dtype=self.weight_dtype)
         if params.cfg_scale > 1.0:
@@ -1557,6 +1568,12 @@ class SanaWMPipeline:
         )
         stage1_chunk_indices = tuple(int(v) for v in solver.create_autoregressive_segments(latent_T))
         n_stage1_chunks = len(stage1_chunk_indices) - 1
+        _progress(
+            "initializing chunk pipeline",
+            stage1_total=n_stage1_chunks,
+            decode_total=max(latent_T - int(self.refiner_settings.sink_size), 0)
+            // int(self.refiner_settings.block_size),
+        )
         stage1_iter = solver.sample_chunks(
             z,
             steps=params.step,
@@ -1564,6 +1581,7 @@ class SanaWMPipeline:
             denoising_step_list=params.denoising_step_list,
         )
 
+        _progress("moving refiner and stage-1 models to GPU")
         self.refiner.move_video_modules(self.device)
         self.refiner.offload_video_unused_audio_modules("cpu")
         self.refiner.prepare_transformer_nvfp4()
@@ -1631,7 +1649,9 @@ class SanaWMPipeline:
             stage1_done_callback=_offload_stage1_after_streaming_sample if sequential_offload else None,
             stage1_chunk_ends=stage1_chunk_indices[1:],
             decoded_chunk_callback=decoded_chunk_callback,
+            progress_callback=progress_callback,
         )
+        _progress("running streaming pipeline", phase="stream")
         result = run_streaming_inference(
             stage1_chunk_iter=stage1_iter,
             n_stage1_chunks=n_stage1_chunks,

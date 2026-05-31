@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import html
 import os
 import queue
 import sys
@@ -93,6 +94,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--streaming_root", type=Path, default=DEFAULT_STREAMING_ROOT)
     parser.add_argument("--output_dir", type=Path, default=Path("demo_outputs/sana_wm_realtime"))
     parser.add_argument("--no_compile", action="store_true")
+    parser.add_argument("--lazy_load", action="store_true")
     return parser
 
 
@@ -229,8 +231,78 @@ def _intrinsics_path(uploaded) -> Path:
     return Path(name or uploaded)
 
 
-def build_demo(args: argparse.Namespace) -> gr.Blocks:
-    state = DemoState(streaming_root=args.streaming_root, no_compile=args.no_compile)
+def _progress_html(
+    *,
+    save_mp4: bool,
+    encoder: str,
+    message: str,
+    frames: int = 0,
+    done: int = 0,
+    total: int = 0,
+    elapsed: float = 0.0,
+    complete: bool = False,
+    path: str | None = None,
+) -> str:
+    total = max(0, int(total))
+    done = max(0, int(done))
+    pct = 100.0 if complete else (100.0 * done / total if total > 0 else 0.0)
+    pct = max(0.0, min(100.0, pct))
+    mode = "MP4" if save_mp4 else "Preview only"
+    safe_message = html.escape(str(message))
+    safe_encoder = html.escape(str(encoder))
+    safe_path = html.escape(str(path or ""))
+    path_line = f"<div class='mp4-progress-path'>{safe_path}</div>" if path else ""
+    return f"""
+    <div class="mp4-progress">
+      <div class="mp4-progress-top">
+        <span>{mode} progress</span>
+        <span>{pct:.1f}%</span>
+      </div>
+      <div class="mp4-progress-bar"><div style="width:{pct:.2f}%"></div></div>
+      <div class="mp4-progress-meta">{safe_message} | chunks {done}/{total or '?'} | frames {int(frames)} | {elapsed:.1f}s | {safe_encoder}</div>
+      {path_line}
+    </div>
+    """
+
+
+def _preload_pipeline(state: DemoState) -> None:
+    t0 = time.perf_counter()
+    print("[demo] preloading Sana-WM pipeline before Gradio launch", flush=True)
+    pipeline = state.get_pipeline()
+    prompt = _default_prompt()
+    if prompt and os.environ.get("SANA_WM_DEMO_PREWARM_PROMPT", "1").lower() not in {"0", "false", "no", "off"}:
+        print("[demo] pre-encoding default stage-1/refiner prompts", flush=True)
+        with torch.inference_mode():
+            pipeline._get_streaming_refiner_prompt(prompt)
+            pipeline._get_streaming_stage1_prompt(prompt, "")
+    print("[demo] preparing resident NVFP4/streaming modules", flush=True)
+    with torch.inference_mode():
+        cpu_stage_nvfp4 = os.environ.get("SANA_WM_TE_NVFP4_CPU_STAGING", "1").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if cpu_stage_nvfp4:
+            pipeline.refiner.offload_video_unused_audio_modules("cpu")
+            pipeline.refiner.prepare_transformer_nvfp4()
+            pipeline.refiner.move_video_modules(pipeline.device)
+            pipeline.refiner.offload_video_unused_audio_modules("cpu")
+        else:
+            pipeline.refiner.move_video_modules(pipeline.device)
+            pipeline.refiner.offload_video_unused_audio_modules("cpu")
+            pipeline.refiner.prepare_transformer_nvfp4()
+        pipeline.model.to(pipeline.device)
+        pipeline._prepare_stage1_nvfp4()
+        if os.environ.get("SANA_WM_STREAMING_LAZY_VAE_DECODER", "1").lower() in {"1", "true", "yes", "on"}:
+            pipeline._move_vae_decoder_for_streaming("cpu")
+        else:
+            pipeline._move_vae_decoder_for_streaming(pipeline.device)
+        torch.cuda.empty_cache()
+    print(f"[demo] pipeline preload complete in {time.perf_counter() - t0:.1f}s", flush=True)
+
+
+def build_demo(args: argparse.Namespace, state: DemoState) -> gr.Blocks:
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     def generate(
@@ -245,7 +317,7 @@ def build_demo(args: argparse.Namespace) -> gr.Blocks:
         encoder_choice: str,
         intrinsics_file,
     ):
-        updates: queue.Queue[tuple[str, object]] = queue.Queue(maxsize=4)
+        updates: queue.Queue[tuple[str, object]] = queue.Queue(maxsize=64)
         started = time.perf_counter()
         selected_encoder = "h264_nvenc" if encoder_choice == "h264_nvenc" else "libx264"
         output_mode = "mp4" if save_mp4 else "cpu"
@@ -280,13 +352,16 @@ def build_demo(args: argparse.Namespace) -> gr.Blocks:
                 ),
             )
 
+        def on_progress(event: dict[str, object]) -> None:
+            put_update("progress", dict(event))
+
         def worker() -> None:
             try:
-                put_update("status", "loading Sana-WM pipeline")
                 pipeline = state.get_pipeline()
-                put_update("status", "pipeline ready; starting generation")
+                put_update("status", "pipeline ready; preparing request")
                 pil_image = _coerce_image(image)
                 prompt_text = (prompt or "").strip()
+                put_update("status", "preparing camera path and intrinsics")
                 c2w_full = action_string_to_c2w(
                     action or DEFAULT_ACTION,
                     translation_speed=float(translation_speed),
@@ -327,6 +402,7 @@ def build_demo(args: argparse.Namespace) -> gr.Blocks:
                     output_mode=output_mode,
                     profile_cuda=False,
                     decoded_chunk_callback=on_chunk,
+                    progress_callback=on_progress,
                 )
                 elapsed = time.perf_counter() - started
                 put_update(
@@ -338,6 +414,7 @@ def build_demo(args: argparse.Namespace) -> gr.Blocks:
                         "rt": result["realtime_factor"],
                         "elapsed": elapsed,
                         "encoder": selected_encoder if output_mode == "mp4" else "preview-only",
+                        "output_mode": output_mode,
                     },
                 )
             except Exception:
@@ -347,34 +424,93 @@ def build_demo(args: argparse.Namespace) -> gr.Blocks:
         thread.start()
         latest = None
         video = None
+        progress_state: dict[str, object] = {
+            "message": "queued",
+            "decode_done": 0,
+            "decode_total": 0,
+            "frames": 0,
+        }
+        progress = _progress_html(
+            save_mp4=bool(save_mp4),
+            encoder=selected_encoder if output_mode == "mp4" else "preview-only",
+            message="queued",
+        )
         status = "starting"
-        yield latest, video, status
+        yield latest, video, progress, status
         while thread.is_alive() or not updates.empty():
             try:
                 kind, value = updates.get(timeout=0.5)
             except queue.Empty:
-                yield latest, video, status
+                progress = _progress_html(
+                    save_mp4=bool(save_mp4),
+                    encoder=selected_encoder if output_mode == "mp4" else "preview-only",
+                    message=str(progress_state.get("message", status)),
+                    frames=int(progress_state.get("frames", 0) or 0),
+                    done=int(progress_state.get("decode_done", 0) or 0),
+                    total=int(progress_state.get("decode_total", 0) or 0),
+                    elapsed=time.perf_counter() - started,
+                )
+                yield latest, video, progress, status
                 continue
             if kind == "status":
                 status = str(value)
+                progress_state["message"] = status
             elif kind == "frame":
                 frame, detail = value
                 latest = _make_preview(frame)
                 status = f"{detail}  elapsed {time.perf_counter() - started:.1f}s"
+            elif kind == "progress":
+                progress_state.update(value)
+                status = str(progress_state.get("message", status))
             elif kind == "done":
                 result = value
                 video = result["path"]
+                progress_state.update(
+                    {
+                        "message": "complete",
+                        "decode_done": progress_state.get("decode_total", 0),
+                        "frames": result["frames"],
+                    }
+                )
                 status = (
                     f"done: {result['frames']} frames, wall {result['wall']:.2f}s, "
                     f"{result['rt']:.3f}x realtime, encoder={result['encoder']}"
                 )
+                progress = _progress_html(
+                    save_mp4=bool(save_mp4),
+                    encoder=str(result["encoder"]),
+                    message="complete",
+                    frames=int(result["frames"]),
+                    done=int(progress_state.get("decode_done", 0) or 0),
+                    total=int(progress_state.get("decode_total", 0) or 0),
+                    elapsed=float(result["elapsed"]),
+                    complete=True,
+                    path=result["path"],
+                )
             elif kind == "error":
                 status = str(value)
-            yield latest, video, status
+                progress_state["message"] = "error"
+            if kind != "done":
+                progress = _progress_html(
+                    save_mp4=bool(save_mp4),
+                    encoder=selected_encoder if output_mode == "mp4" else "preview-only",
+                    message=str(progress_state.get("message", status)),
+                    frames=int(progress_state.get("frames", 0) or 0),
+                    done=int(progress_state.get("decode_done", 0) or 0),
+                    total=int(progress_state.get("decode_total", 0) or 0),
+                    elapsed=time.perf_counter() - started,
+                )
+            yield latest, video, progress, status
 
     css = """
     .gradio-container { max-width: 1180px !important; }
     #preview img { object-fit: contain; }
+    .mp4-progress { border: 1px solid #333; border-radius: 6px; padding: 10px 12px; background: #161616; }
+    .mp4-progress-top { display: flex; justify-content: space-between; font-weight: 600; margin-bottom: 8px; }
+    .mp4-progress-bar { height: 10px; background: #2a2a2a; border-radius: 999px; overflow: hidden; }
+    .mp4-progress-bar > div { height: 100%; background: #3b82f6; transition: width 160ms linear; }
+    .mp4-progress-meta, .mp4-progress-path { margin-top: 8px; color: #cfcfcf; font-size: 12px; }
+    .mp4-progress-path { word-break: break-all; }
     """
     with gr.Blocks(css=css, title="Sana-WM Realtime") as demo:
         gr.Markdown("Sana-WM Realtime")
@@ -391,11 +527,15 @@ def build_demo(args: argparse.Namespace) -> gr.Blocks:
                     translation = gr.Number(value=0.055, label="Translation")
                     rotation = gr.Number(value=1.2, label="Rotation deg")
                 encoder = gr.Radio(["h264_nvenc", "libx264"], value="h264_nvenc", label="MP4 encoder")
-                save_mp4 = gr.Checkbox(value=False, label="Save final MP4")
+                save_mp4 = gr.Checkbox(value=True, label="Save final MP4")
                 run = gr.Button("Generate", variant="primary")
             with gr.Column(scale=2):
                 preview = gr.Image(label="Live preview", elem_id="preview")
                 video = gr.Video(label="Final MP4")
+                mp4_progress = gr.HTML(
+                    _progress_html(save_mp4=True, encoder="h264_nvenc", message="idle"),
+                    label="Final MP4 progress",
+                )
                 status = gr.Textbox(label="Status", lines=4)
 
         run.click(
@@ -412,7 +552,7 @@ def build_demo(args: argparse.Namespace) -> gr.Blocks:
                 encoder,
                 intrinsics,
             ],
-            outputs=[preview, video, status],
+            outputs=[preview, video, mp4_progress, status],
             show_progress=True,
             concurrency_limit=1,
         )
@@ -421,7 +561,10 @@ def build_demo(args: argparse.Namespace) -> gr.Blocks:
 
 def main() -> None:
     args = _build_parser().parse_args()
-    demo = build_demo(args)
+    state = DemoState(streaming_root=args.streaming_root, no_compile=args.no_compile)
+    if not args.lazy_load:
+        _preload_pipeline(state)
+    demo = build_demo(args, state)
     demo.queue(max_size=1).launch(
         server_name=args.server_name,
         server_port=args.server_port,
