@@ -32,9 +32,13 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 import gc
+import hashlib
+import json
 import os
 from pathlib import Path
 import re
+import time
+import types
 
 import torch
 from torch import nn
@@ -76,11 +80,29 @@ class DiffusersLTX2Refiner(nn.Module):
         from diffusers.models.transformers.transformer_ltx2 import LTX2VideoTransformer3DModel
         from diffusers.pipelines.ltx2 import LTX2TextConnectors
 
-        transformer = LTX2VideoTransformer3DModel.from_pretrained(
-            self.refiner_root,
-            subfolder="transformer",
-            torch_dtype=self.dtype,
-        ).eval()
+        cache_path = self._prepared_transformer_cache_path()
+        if cache_path is not None and cache_path.is_file():
+            t0 = time.perf_counter()
+            print(f"[refiner-cache] loading prepared transformer from {cache_path}", flush=True)
+            try:
+                transformer = torch.load(cache_path, map_location=self.device, weights_only=False).eval()
+                self._te_nvfp4_converted = bool(self._te_nvfp4_requested)
+                self._self_qkv_fused = _env_flag("SANA_WM_REFINER_FUSE_SELF_QKV")
+                self._te_nvfp4_recipe = self._make_nvfp4_recipe() if self._te_nvfp4_converted else None
+                print(f"[refiner-cache] loaded prepared transformer in {time.perf_counter() - t0:.1f}s", flush=True)
+            except Exception as exc:
+                print(f"[refiner-cache] failed to load {cache_path}: {exc}; rebuilding", flush=True)
+                transformer = LTX2VideoTransformer3DModel.from_pretrained(
+                    self.refiner_root,
+                    subfolder="transformer",
+                    torch_dtype=self.dtype,
+                ).eval()
+        else:
+            transformer = LTX2VideoTransformer3DModel.from_pretrained(
+                self.refiner_root,
+                subfolder="transformer",
+                torch_dtype=self.dtype,
+            ).eval()
         if (
             not self._te_nvfp4_requested
             and os.environ.get("SANA_WM_REFINER_FP8_STORAGE", "").lower() in {"1", "true", "yes", "on"}
@@ -103,17 +125,77 @@ class DiffusersLTX2Refiner(nn.Module):
         ).eval()
         return transformer, connectors
 
+    def _make_nvfp4_recipe(self):
+        import transformer_engine.common.recipe as te_recipe
+
+        return te_recipe.NVFP4BlockScaling(
+            disable_rht=True,
+            disable_stochastic_rounding=True,
+        )
+
+    def _prepared_transformer_cache_path(self) -> Path | None:
+        root = _prepared_module_cache_root()
+        if root is None or not self._te_nvfp4_requested:
+            return None
+        payload = {
+            "kind": "refiner_transformer_prepared_v2",
+            "refiner_root": _path_fingerprint(self.refiner_root / "transformer"),
+            "dtype": str(self.dtype),
+            "torch": torch.__version__,
+            "refiner_nvfp4": os.environ.get("SANA_WM_REFINER_NVFP4", ""),
+            "refiner_nvfp4_skip_patterns": os.environ.get("SANA_WM_REFINER_NVFP4_SKIP_PATTERNS", ""),
+            "refiner_fuse_self_qkv": os.environ.get("SANA_WM_REFINER_FUSE_SELF_QKV", ""),
+            "te_cpu_staging": os.environ.get("SANA_WM_TE_NVFP4_CPU_STAGING", ""),
+        }
+        try:
+            import transformer_engine
+
+            payload["transformer_engine"] = getattr(transformer_engine, "__version__", "unknown")
+        except Exception:
+            payload["transformer_engine"] = "unavailable"
+        return root / "refiner" / f"{_prepared_module_cache_hash(payload)}.pt"
+
+    def _save_prepared_transformer_cache(self) -> None:
+        if os.environ.get("SANA_WM_PREPARED_MODULE_CACHE_SAVE", "1").strip().lower() in {
+            "",
+            "0",
+            "false",
+            "no",
+            "off",
+        }:
+            return
+        cache_path = self._prepared_transformer_cache_path()
+        if cache_path is None or cache_path.is_file():
+            return
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = cache_path.with_suffix(cache_path.suffix + f".tmp.{os.getpid()}")
+        t0 = time.perf_counter()
+        print(f"[refiner-cache] saving prepared transformer to {cache_path}", flush=True)
+        restore = _strip_local_callables_for_pickle(self.transformer)
+        if restore:
+            print(f"[refiner-cache] stripped {len(restore)} init-only callables before save", flush=True)
+        try:
+            torch.save(self.transformer, tmp_path)
+            os.replace(tmp_path, cache_path)
+        except Exception as exc:
+            print(f"[refiner-cache] failed to save {cache_path}: {exc}", flush=True)
+        finally:
+            _restore_stripped_pickle_values(restore)
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except OSError:
+                pass
+        if cache_path.is_file():
+            print(f"[refiner-cache] saved prepared transformer in {time.perf_counter() - t0:.1f}s", flush=True)
+
     def prepare_transformer_nvfp4(self) -> None:
         """Lazily replace eligible refiner Linear layers with TE NVFP4 Linear modules."""
         self._prepare_self_qkv_fusion()
         if not self._te_nvfp4_requested or self._te_nvfp4_converted:
             return
-        import transformer_engine.common.recipe as te_recipe
 
-        recipe = te_recipe.NVFP4BlockScaling(
-            disable_rht=True,
-            disable_stochastic_rounding=True,
-        )
+        recipe = self._make_nvfp4_recipe()
         converted, skipped = _replace_linear_with_te_nvfp4(
             self.transformer,
             recipe=recipe,
@@ -139,6 +221,7 @@ class DiffusersLTX2Refiner(nn.Module):
         self._te_nvfp4_recipe = recipe
         self._te_nvfp4_converted = True
         _empty_cuda_cache()
+        self._save_prepared_transformer_cache()
 
     def _prepare_self_qkv_fusion(self) -> None:
         if self._self_qkv_fused or not _env_flag("SANA_WM_REFINER_FUSE_SELF_QKV"):
@@ -2205,6 +2288,133 @@ def _env_flag(name: str) -> bool:
 
 def _env_flag_default_true(name: str) -> bool:
     return os.environ.get(name, "1").strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def _prepared_module_cache_root() -> Path | None:
+    if os.environ.get("SANA_WM_PREPARED_MODULE_CACHE", "").strip().lower() not in {"1", "true", "yes", "on"}:
+        return None
+    root = os.environ.get("SANA_WM_PREPARED_MODULE_CACHE_DIR", "").strip()
+    return Path(root).expanduser() if root else Path.home() / ".cache" / "sana_wm_prepared_modules"
+
+
+def _prepared_module_cache_hash(payload: dict[str, object]) -> str:
+    blob = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()[:20]
+
+
+def _path_fingerprint(path: str | Path) -> dict[str, object]:
+    raw = str(path)
+    try:
+        resolved = Path(raw).expanduser().resolve()
+    except Exception:
+        return {"path": raw}
+    if resolved.is_dir():
+        markers = []
+        for rel in ("config.json", "diffusion_pytorch_model.safetensors", "model.safetensors"):
+            item = resolved / rel
+            try:
+                stat = item.stat()
+            except OSError:
+                continue
+            markers.append((rel, int(stat.st_size), int(stat.st_mtime_ns)))
+        return {"path": str(resolved), "markers": markers}
+    try:
+        stat = resolved.stat()
+    except OSError:
+        return {"path": str(resolved)}
+    return {"path": str(resolved), "size": int(stat.st_size), "mtime_ns": int(stat.st_mtime_ns)}
+
+
+def _is_local_callable_for_pickle(value: object) -> bool:
+    if isinstance(value, types.MethodType):
+        value = value.__func__
+    if not isinstance(value, types.FunctionType):
+        return False
+    qualname = getattr(value, "__qualname__", "")
+    return "<locals>" in qualname or getattr(value, "__name__", "") == "<lambda>"
+
+
+def _strip_local_callables_for_pickle(root: object) -> list[tuple[object, object, object, str]]:
+    """Temporarily remove TE init closures that are not used after construction."""
+
+    restore: list[tuple[object, object, object, str]] = []
+    seen: set[int] = set()
+    leaf_types = (str, bytes, int, float, bool, type(None), Path, torch.device, torch.dtype)
+
+    def set_value(owner: object, key: object, old_value: object, new_value: object, kind: str) -> None:
+        if kind == "dict":
+            owner[key] = new_value
+        elif kind == "list":
+            owner[key] = new_value
+        else:
+            setattr(owner, str(key), new_value)
+        restore.append((owner, key, old_value, kind))
+
+    def scrub_value(value: object) -> tuple[object, bool]:
+        if _is_local_callable_for_pickle(value):
+            return None, True
+        if hasattr(value, "_replace") and hasattr(value, "init_fn"):
+            updates = {}
+            if _is_local_callable_for_pickle(getattr(value, "init_fn", None)):
+                updates["init_fn"] = None
+            if _is_local_callable_for_pickle(getattr(value, "get_rng_state_tracker", None)):
+                updates["get_rng_state_tracker"] = None
+            if updates:
+                return value._replace(**updates), True
+        return value, False
+
+    def walk(obj: object) -> None:
+        if isinstance(obj, leaf_types) or isinstance(obj, (torch.Tensor, nn.Parameter)):
+            return
+        obj_id = id(obj)
+        if obj_id in seen:
+            return
+        seen.add(obj_id)
+
+        if isinstance(obj, dict):
+            for key, value in list(obj.items()):
+                new_value, changed = scrub_value(value)
+                if changed:
+                    set_value(obj, key, value, new_value, "dict")
+                else:
+                    walk(value)
+            return
+        if isinstance(obj, list):
+            for index, value in enumerate(list(obj)):
+                new_value, changed = scrub_value(value)
+                if changed:
+                    set_value(obj, index, value, new_value, "list")
+                else:
+                    walk(value)
+            return
+        if isinstance(obj, tuple):
+            return
+
+        try:
+            items = list(vars(obj).items())
+        except TypeError:
+            return
+        for key, value in items:
+            if key.startswith("__"):
+                continue
+            new_value, changed = scrub_value(value)
+            if changed:
+                set_value(obj, key, value, new_value, "attr")
+            elif key not in {"_parameters", "_buffers"}:
+                walk(value)
+
+    walk(root)
+    return restore
+
+
+def _restore_stripped_pickle_values(restore: list[tuple[object, object, object, str]]) -> None:
+    for owner, key, value, kind in reversed(restore):
+        if kind == "dict":
+            owner[key] = value
+        elif kind == "list":
+            owner[key] = value
+        else:
+            setattr(owner, str(key), value)
 
 
 def _te_module_name_variants(name: str) -> tuple[str, ...]:

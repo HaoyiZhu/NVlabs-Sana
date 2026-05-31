@@ -35,6 +35,8 @@ propagate into the generated geometry.
 
 import argparse
 import gc
+import hashlib
+import json
 import logging
 import math
 import os
@@ -143,6 +145,121 @@ _STAGE1_NVFP4_INCLUDE_BY_MODE = {
 }
 
 
+def _prepared_module_cache_root() -> Path | None:
+    if os.environ.get("SANA_WM_PREPARED_MODULE_CACHE", "").strip().lower() not in {"1", "true", "yes", "on"}:
+        return None
+    root = os.environ.get("SANA_WM_PREPARED_MODULE_CACHE_DIR", "").strip()
+    return Path(root).expanduser() if root else Path.home() / ".cache" / "sana_wm_prepared_modules"
+
+
+def _prepared_module_cache_hash(payload: dict[str, object]) -> str:
+    blob = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()[:20]
+
+
+def _path_fingerprint(path: str | Path) -> dict[str, object]:
+    raw = str(path)
+    try:
+        resolved = Path(raw).expanduser().resolve()
+    except Exception:
+        return {"path": raw}
+    try:
+        stat = resolved.stat()
+    except OSError:
+        return {"path": str(resolved)}
+    return {"path": str(resolved), "size": int(stat.st_size), "mtime_ns": int(stat.st_mtime_ns)}
+
+
+def _is_local_callable_for_pickle(value: object) -> bool:
+    if isinstance(value, types.MethodType):
+        value = value.__func__
+    if not isinstance(value, types.FunctionType):
+        return False
+    qualname = getattr(value, "__qualname__", "")
+    return "<locals>" in qualname or getattr(value, "__name__", "") == "<lambda>"
+
+
+def _strip_local_callables_for_pickle(root: object) -> list[tuple[object, object, object, str]]:
+    restore: list[tuple[object, object, object, str]] = []
+    seen: set[int] = set()
+    leaf_types = (str, bytes, int, float, bool, type(None), Path, torch.device, torch.dtype)
+
+    def set_value(owner: object, key: object, old_value: object, new_value: object, kind: str) -> None:
+        if kind == "dict":
+            owner[key] = new_value
+        elif kind == "list":
+            owner[key] = new_value
+        else:
+            setattr(owner, str(key), new_value)
+        restore.append((owner, key, old_value, kind))
+
+    def scrub_value(value: object) -> tuple[object, bool]:
+        if _is_local_callable_for_pickle(value):
+            return None, True
+        if hasattr(value, "_replace") and hasattr(value, "init_fn"):
+            updates = {}
+            if _is_local_callable_for_pickle(getattr(value, "init_fn", None)):
+                updates["init_fn"] = None
+            if _is_local_callable_for_pickle(getattr(value, "get_rng_state_tracker", None)):
+                updates["get_rng_state_tracker"] = None
+            if updates:
+                return value._replace(**updates), True
+        return value, False
+
+    def walk(obj: object) -> None:
+        if isinstance(obj, leaf_types) or isinstance(obj, (torch.Tensor, nn.Parameter)):
+            return
+        obj_id = id(obj)
+        if obj_id in seen:
+            return
+        seen.add(obj_id)
+
+        if isinstance(obj, dict):
+            for key, value in list(obj.items()):
+                new_value, changed = scrub_value(value)
+                if changed:
+                    set_value(obj, key, value, new_value, "dict")
+                else:
+                    walk(value)
+            return
+        if isinstance(obj, list):
+            for index, value in enumerate(list(obj)):
+                new_value, changed = scrub_value(value)
+                if changed:
+                    set_value(obj, index, value, new_value, "list")
+                else:
+                    walk(value)
+            return
+        if isinstance(obj, tuple):
+            return
+
+        try:
+            items = list(vars(obj).items())
+        except TypeError:
+            return
+        for key, value in items:
+            if key.startswith("__"):
+                continue
+            new_value, changed = scrub_value(value)
+            if changed:
+                set_value(obj, key, value, new_value, "attr")
+            elif key not in {"_parameters", "_buffers"}:
+                walk(value)
+
+    walk(root)
+    return restore
+
+
+def _restore_stripped_pickle_values(restore: list[tuple[object, object, object, str]]) -> None:
+    for owner, key, value, kind in reversed(restore):
+        if kind == "dict":
+            owner[key] = value
+        elif kind == "list":
+            owner[key] = value
+        else:
+            setattr(owner, str(key), value)
+
+
 def _stage1_nvfp4_mode() -> str:
     raw = os.environ.get("SANA_WM_STAGE1_NVFP4", "").strip().lower()
     if raw in _ENV_FALSE:
@@ -185,6 +302,27 @@ def _stage1_nvfp4_uses_cross_attention() -> bool:
     if any(item.strip() == "cross" for item in mode.replace("+", ",").split(",")):
         return True
     return any("cross_attn" in pattern for pattern in _te_env_tuple("SANA_WM_STAGE1_NVFP4_INCLUDE_PATTERNS"))
+
+
+def _stage1_forward_long_nvfp4(_self, *args, **kwargs):
+    import transformer_engine.pytorch as te
+
+    with te.fp8_autocast(enabled=True, fp8_recipe=_self._sana_wm_stage1_nvfp4_recipe):
+        return type(_self).forward_long(_self, *args, **kwargs)
+
+
+def _make_stage1_nvfp4_recipe():
+    import transformer_engine.common.recipe as te_recipe
+
+    return te_recipe.NVFP4BlockScaling(
+        disable_rht=True,
+        disable_stochastic_rounding=True,
+    )
+
+
+def _restore_stage1_nvfp4_runtime(model: nn.Module) -> None:
+    model._sana_wm_stage1_nvfp4_recipe = _make_stage1_nvfp4_recipe()
+    model.forward_long = types.MethodType(_stage1_forward_long_nvfp4, model)
 
 
 class _LinearizedPointwiseConv(nn.Module):
@@ -771,6 +909,7 @@ class SanaWMPipeline:
         self.offload_refiner = offload_refiner
         self.offload_text_encoder = offload_text_encoder
         self.logger = logger or get_root_logger()
+        self._model_path = model_path
         self.weight_dtype = get_weight_dtype(config.model.mixed_precision)
         self.vae_dtype = get_weight_dtype(config.vae.weight_dtype)
         self._refiner_built = False
@@ -813,6 +952,22 @@ class SanaWMPipeline:
         )
 
     def _build_model(self, model_path: str | Path) -> None:
+        cache_path = self._stage1_prepared_cache_path(model_path)
+        if cache_path is not None and cache_path.is_file():
+            t0 = time.perf_counter()
+            self.logger.info("[stage1-cache] loading prepared Stage-1 model from %s", cache_path)
+            try:
+                model = torch.load(cache_path, map_location=self.device, weights_only=False)
+                self.model = model.eval()
+                if getattr(self.model, "_sana_wm_stage1_nvfp4_converted", False):
+                    _restore_stage1_nvfp4_runtime(self.model)
+                else:
+                    self.model = self.model.to(device=self.device, dtype=self.weight_dtype)
+                self.logger.info("[stage1-cache] loaded prepared Stage-1 model in %.1fs", time.perf_counter() - t0)
+                return
+            except Exception as exc:
+                self.logger.warning("[stage1-cache] failed to load %s: %s; rebuilding", cache_path, exc)
+
         latent_size = self.config.model.image_size // self.config.vae.vae_stride[-1]
         kwargs = model_video_camctrl_init_config(self.config, latent_size=latent_size)
         model = build_model(
@@ -835,6 +990,71 @@ class SanaWMPipeline:
         if unexpected:
             self.logger.warning(f"Unexpected keys: {unexpected}")
         self.model = model.eval().to(self.weight_dtype)
+
+    def _stage1_prepared_cache_path(self, model_path: str | Path) -> Path | None:
+        root = _prepared_module_cache_root()
+        mode = _stage1_nvfp4_mode()
+        if root is None or not mode:
+            return None
+        payload = {
+            "kind": "stage1_prepared_model_v2",
+            "model_path": _path_fingerprint(model_path),
+            "model_name": self.config.model.model,
+            "dtype": str(self.weight_dtype),
+            "torch": torch.__version__,
+            "stage1_nvfp4_mode": mode,
+            "stage1_linearize_ffn": os.environ.get("SANA_WM_STAGE1_LINEARIZE_FFN", ""),
+            "stage1_text_pad_multiple": os.environ.get("SANA_WM_STAGE1_NVFP4_TEXT_PAD_MULTIPLE", ""),
+            "stage1_skip_patterns": os.environ.get("SANA_WM_STAGE1_NVFP4_SKIP_PATTERNS", ""),
+            "stage1_include_patterns": os.environ.get("SANA_WM_STAGE1_NVFP4_INCLUDE_PATTERNS", ""),
+            "stage1_no_default_skips": os.environ.get("SANA_WM_STAGE1_NVFP4_NO_DEFAULT_SKIPS", ""),
+            "te_cpu_staging": os.environ.get("SANA_WM_TE_NVFP4_CPU_STAGING", ""),
+        }
+        try:
+            import transformer_engine
+
+            payload["transformer_engine"] = getattr(transformer_engine, "__version__", "unknown")
+        except Exception:
+            payload["transformer_engine"] = "unavailable"
+        return root / "stage1" / f"{_prepared_module_cache_hash(payload)}.pt"
+
+    def _save_stage1_prepared_cache(self, model_path: str | Path) -> None:
+        if os.environ.get("SANA_WM_PREPARED_MODULE_CACHE_SAVE", "1").strip().lower() in {
+            "",
+            "0",
+            "false",
+            "no",
+            "off",
+        }:
+            return
+        cache_path = self._stage1_prepared_cache_path(model_path)
+        model = getattr(self, "model", None)
+        if cache_path is None or model is None or cache_path.is_file():
+            return
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = cache_path.with_suffix(cache_path.suffix + f".tmp.{os.getpid()}")
+        t0 = time.perf_counter()
+        self.logger.info("[stage1-cache] saving prepared Stage-1 model to %s", cache_path)
+        forward_long = model.__dict__.pop("forward_long", None)
+        restore = _strip_local_callables_for_pickle(model)
+        if restore:
+            self.logger.info("[stage1-cache] stripped %d init-only callables before save", len(restore))
+        try:
+            torch.save(model, tmp_path)
+            os.replace(tmp_path, cache_path)
+        except Exception as exc:
+            self.logger.warning("[stage1-cache] failed to save %s: %s", cache_path, exc)
+        finally:
+            _restore_stripped_pickle_values(restore)
+            if forward_long is not None:
+                model.forward_long = forward_long
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except OSError:
+                pass
+        if cache_path.is_file():
+            self.logger.info("[stage1-cache] saved prepared Stage-1 model in %.1fs", time.perf_counter() - t0)
 
     def _prepare_stage1_nvfp4(self) -> None:
         mode = _stage1_nvfp4_mode()
@@ -863,13 +1083,7 @@ class SanaWMPipeline:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-        import transformer_engine.common.recipe as te_recipe
-        import transformer_engine.pytorch as te
-
-        recipe = te_recipe.NVFP4BlockScaling(
-            disable_rht=True,
-            disable_stochastic_rounding=True,
-        )
+        recipe = _make_stage1_nvfp4_recipe()
         skip_patterns: tuple[str, ...] = ()
         if not _te_env_flag("SANA_WM_STAGE1_NVFP4_NO_DEFAULT_SKIPS"):
             skip_patterns = _STAGE1_NVFP4_SKIP_DEFAULTS
@@ -888,15 +1102,9 @@ class SanaWMPipeline:
                 f"skipped={skipped}, include_patterns={include_patterns}."
             )
 
-        orig_forward_long = model.forward_long
-
-        def _forward_long_nvfp4(_self, *args, **kwargs):
-            with te.fp8_autocast(enabled=True, fp8_recipe=recipe):
-                return orig_forward_long(*args, **kwargs)
-
-        model.forward_long = types.MethodType(_forward_long_nvfp4, model)
         model._sana_wm_stage1_nvfp4_converted = True
         model._sana_wm_stage1_nvfp4_recipe = recipe
+        model.forward_long = types.MethodType(_stage1_forward_long_nvfp4, model)
         self.logger.info(
             "[stage1-nvfp4] mode=%s converted %d Linear layers (skipped %d)",
             mode,
@@ -904,6 +1112,8 @@ class SanaWMPipeline:
             skipped,
         )
         torch.cuda.empty_cache()
+        if hasattr(self, "_model_path"):
+            self._save_stage1_prepared_cache(self._model_path)
 
     def _build_refiner(self) -> None:
         if self.refiner_settings is None:
@@ -1146,11 +1356,34 @@ class SanaWMPipeline:
 
         # A 32GB 5090 cannot hold Gemma plus the resident DiT/VAE/refiner stack,
         # so temporarily spill the generation models while the prompt is encoded.
-        self.model.to("cpu")
+        # TE NVFP4 tensors cannot be moved to CPU without dequantizing; for those
+        # prepared-cache models, release them and reload from cache after encoding.
+        dropped_stage1 = False
+        dropped_refiner = False
+        if getattr(self.model, "_sana_wm_stage1_nvfp4_converted", False):
+            model = self.model
+            self.model = None
+            del model
+            dropped_stage1 = True
+        else:
+            self.model.to("cpu")
         self._move_vae_decoder_for_streaming("cpu")
-        self.refiner.move_video_modules("cpu")
+        if getattr(self.refiner, "_te_nvfp4_converted", False):
+            transformer = self.refiner.transformer
+            self.refiner.transformer = None
+            del transformer
+            dropped_refiner = True
+        else:
+            self.refiner.move_video_modules("cpu")
+        gc.collect()
         torch.cuda.empty_cache()
-        embeds, attention_mask = self.refiner._encode_prompt(prompt)
+        try:
+            embeds, attention_mask = self.refiner._encode_prompt(prompt)
+        finally:
+            if dropped_refiner:
+                self._build_refiner()
+            if dropped_stage1:
+                self._build_model(self._model_path)
         if self._streaming_prompt_cache_enabled():
             cache.clear()
             cache[key] = (embeds.detach(), attention_mask.detach())

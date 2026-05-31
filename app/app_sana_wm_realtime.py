@@ -24,6 +24,8 @@ os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", str(Path.home() / ".cache" / "sana_wm_torchinductor"))
 os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
+os.environ.setdefault("SANA_WM_PREPARED_MODULE_CACHE", "1")
+os.environ.setdefault("SANA_WM_PREPARED_MODULE_CACHE_DIR", str(Path.home() / ".cache" / "sana_wm_prepared_modules"))
 if "--cuda_visible_devices" in sys.argv:
     idx = sys.argv.index("--cuda_visible_devices")
     if idx + 1 < len(sys.argv):
@@ -80,7 +82,7 @@ from inference_video_scripts.inference_sana_wm_streaming import (  # noqa: E402
     DEFAULT_STREAMING_ROOT,
     _apply_fast_defaults,
 )
-from inference_video_scripts.streaming_mp4_writer import resolve_ffmpeg_exe  # noqa: E402
+from inference_video_scripts.streaming_mp4_writer import StreamingMp4Writer, resolve_ffmpeg_exe  # noqa: E402
 
 
 TARGET_HEIGHT = 704
@@ -306,6 +308,35 @@ def _progress_html(
     """
 
 
+def _encode_chunk_mp4(
+    frames: np.ndarray,
+    output_path: Path,
+    *,
+    fps: int,
+    encoder: str,
+) -> Path:
+    preset = "p4" if str(encoder).strip().lower() == "h264_nvenc" else "veryfast"
+    writer = StreamingMp4Writer(
+        output_path,
+        height=int(frames.shape[1]),
+        width=int(frames.shape[2]),
+        fps=int(fps),
+        crf=18,
+        preset=preset,
+        encoder=encoder,
+        loglevel="error",
+    )
+    try:
+        writer.write_chunk(np.ascontiguousarray(frames))
+        return writer.close()
+    except Exception:
+        try:
+            writer.close()
+        except Exception:
+            pass
+        raise
+
+
 def _warmup_streaming_pipeline(pipeline: SanaWMPipeline, prompt: str) -> None:
     if not _env_enabled("SANA_WM_DEMO_PREWARM_STREAM", "1"):
         return
@@ -480,8 +511,11 @@ def build_demo(args: argparse.Namespace, state: DemoState) -> gr.Blocks:
         else:
             updates.put(("status", "MP4 saving is off; streaming decoded chunks directly to the preview."))
 
+        encode_jobs: queue.Queue[tuple[np.ndarray, int, int, Path, str] | None] = queue.Queue(maxsize=8)
+        segment_dir_ref: dict[str, Path | None] = {"path": None}
+
         def put_update(kind: str, value: object) -> None:
-            if kind == "chunk":
+            if kind in {"chunk", "chunk_video"}:
                 updates.put((kind, value))
                 return
             try:
@@ -496,17 +530,41 @@ def build_demo(args: argparse.Namespace, state: DemoState) -> gr.Blocks:
         def on_chunk(pixel_np: np.ndarray, frame_base: int, chunk_idx: int) -> None:
             if pixel_np.shape[0] <= 0:
                 return
-            put_update(
-                "chunk",
-                (
-                    pixel_np.copy(),
-                    int(frame_base),
-                    int(chunk_idx),
-                ),
-            )
+            segment_dir = segment_dir_ref["path"]
+            if segment_dir is None:
+                return
+            encode_jobs.put((pixel_np.copy(), int(frame_base), int(chunk_idx), segment_dir, selected_encoder))
 
         def on_progress(event: dict[str, object]) -> None:
             put_update("progress", dict(event))
+
+        def segment_encoder() -> None:
+            while True:
+                item = encode_jobs.get()
+                if item is None:
+                    return
+                frames, frame_base, chunk_idx, segment_dir, encoder = item
+                try:
+                    segment_dir.mkdir(parents=True, exist_ok=True)
+                    segment_path = segment_dir / f"chunk_{chunk_idx:04d}.mp4"
+                    encoded_path = _encode_chunk_mp4(
+                        frames,
+                        segment_path,
+                        fps=DEFAULT_FPS,
+                        encoder=encoder,
+                    )
+                    put_update(
+                        "chunk_video",
+                        {
+                            "path": str(encoded_path),
+                            "frame_base": int(frame_base),
+                            "chunk_idx": int(chunk_idx),
+                            "frames": int(frames.shape[0]),
+                            "duration": float(frames.shape[0]) / float(DEFAULT_FPS),
+                        },
+                    )
+                except Exception:
+                    put_update("error", traceback.format_exc())
 
         def worker() -> None:
             try:
@@ -547,6 +605,7 @@ def build_demo(args: argparse.Namespace, state: DemoState) -> gr.Blocks:
                 )
                 out_dir = args.output_dir / time.strftime("%Y%m%d_%H%M%S")
                 out_dir.mkdir(parents=True, exist_ok=True)
+                segment_dir_ref["path"] = out_dir / "live_chunks"
                 output_path = out_dir / "sana_wm_realtime.mp4"
                 result = pipeline.generate_streaming(
                     cropped,
@@ -578,19 +637,23 @@ def build_demo(args: argparse.Namespace, state: DemoState) -> gr.Blocks:
                 )
             except Exception:
                 put_update("error", traceback.format_exc())
+            finally:
+                encode_jobs.put(None)
 
+        encoder_thread = threading.Thread(target=segment_encoder, daemon=True)
+        encoder_thread.start()
         thread = threading.Thread(target=worker, daemon=True)
         thread.start()
-        latest = None
+        latest_segment = None
         video = None
-        fps = float(DEFAULT_FPS)
-        frame_interval = 1.0 / fps
-        frame_buffer: deque[np.ndarray] = deque()
+        segment_buffer: deque[dict[str, object]] = deque()
         chunks_received = 0
         playback_started = False
-        next_frame_time: float | None = None
+        next_segment_time: float | None = None
+        played_segments = 0
         played_frames = 0
         generation_done = False
+        final_video_pending = False
         last_yield = time.perf_counter()
         progress_state: dict[str, object] = {
             "message": "queued",
@@ -604,13 +667,13 @@ def build_demo(args: argparse.Namespace, state: DemoState) -> gr.Blocks:
             message="queued",
         )
         status = "starting"
-        yield latest, video, progress, status
-        while thread.is_alive() or not updates.empty() or frame_buffer:
+        yield latest_segment, video, progress, status
+        while thread.is_alive() or encoder_thread.is_alive() or not updates.empty() or segment_buffer:
             now = time.perf_counter()
-            if playback_started and frame_buffer and next_frame_time is not None:
-                timeout = max(0.0, min(0.05, next_frame_time - now))
+            if playback_started and segment_buffer and next_segment_time is not None:
+                timeout = max(0.0, min(0.1, next_segment_time - now))
             else:
-                timeout = 0.05
+                timeout = 0.1
             got_update = False
             try:
                 kind, value = updates.get(timeout=timeout)
@@ -622,26 +685,28 @@ def build_demo(args: argparse.Namespace, state: DemoState) -> gr.Blocks:
                 if kind == "status":
                     status = str(value)
                     progress_state["message"] = status
-                elif kind == "chunk":
-                    chunk_np, frame_base, chunk_idx = value
+                elif kind == "chunk_video":
+                    segment = dict(value)
+                    frame_base = int(segment["frame_base"])
+                    chunk_idx = int(segment["chunk_idx"])
+                    n_frames = int(segment["frames"])
                     chunks_received += 1
-                    for frame in chunk_np:
-                        frame_buffer.append(frame)
+                    segment_buffer.append(segment)
                     progress_state["frames"] = max(
                         int(progress_state.get("frames", 0) or 0),
-                        int(frame_base) + int(chunk_np.shape[0]),
+                        frame_base + n_frames,
                     )
                     if chunks_received < 2 and not playback_started:
                         status = (
-                            f"buffering chunk {chunks_received}/2 "
-                            f"({len(frame_buffer)} frames) before realtime playback"
+                            f"buffering chunk mp4 {chunks_received}/2 "
+                            f"({n_frames} frames in latest segment)"
                         )
                     elif not playback_started:
                         playback_started = True
-                        next_frame_time = time.perf_counter()
-                        status = f"realtime playback started from chunk {chunk_idx:02d}"
+                        next_segment_time = time.perf_counter()
+                        status = f"chunk mp4 playback started from chunk {chunk_idx:02d}"
                     else:
-                        status = f"received chunk {chunk_idx:02d}; buffered {len(frame_buffer)} frames"
+                        status = f"received chunk mp4 {chunk_idx:02d}; buffered {len(segment_buffer)} segments"
                 elif kind == "progress":
                     progress_state.update(value)
                     if not playback_started:
@@ -650,9 +715,10 @@ def build_demo(args: argparse.Namespace, state: DemoState) -> gr.Blocks:
                     result = value
                     generation_done = True
                     video = result["path"]
-                    if frame_buffer and not playback_started:
+                    final_video_pending = bool(video)
+                    if segment_buffer and not playback_started:
                         playback_started = True
-                        next_frame_time = time.perf_counter()
+                        next_segment_time = time.perf_counter()
                     progress_state.update(
                         {
                             "message": "complete",
@@ -673,7 +739,7 @@ def build_demo(args: argparse.Namespace, state: DemoState) -> gr.Blocks:
                     )
                     status = (
                         f"generation done: {result['frames']} frames, wall {result['wall']:.2f}s, "
-                        f"{result['rt']:.3f}x realtime; playing remaining buffer"
+                        f"{result['rt']:.3f}x realtime; playing remaining live segments"
                     )
                 elif kind == "error":
                     status = str(value)
@@ -691,26 +757,36 @@ def build_demo(args: argparse.Namespace, state: DemoState) -> gr.Blocks:
                 )
 
             now = time.perf_counter()
-            if playback_started and frame_buffer and (next_frame_time is None or now >= next_frame_time):
-                latest = _make_preview(frame_buffer.popleft())
-                played_frames += 1
-                if next_frame_time is None or now - next_frame_time > 1.0:
-                    next_frame_time = now + frame_interval
+            if playback_started and segment_buffer and (next_segment_time is None or now >= next_segment_time):
+                segment = segment_buffer.popleft()
+                latest_segment = str(segment["path"])
+                duration = max(0.25, float(segment["duration"]))
+                played_segments += 1
+                played_frames += int(segment["frames"])
+                if next_segment_time is None or now - next_segment_time > 1.0:
+                    next_segment_time = now + duration
                 else:
-                    next_frame_time += frame_interval
-                if generation_done and not frame_buffer:
+                    next_segment_time += duration
+                if generation_done and not segment_buffer:
                     status = f"playback complete: {played_frames} frames displayed"
                 else:
-                    status = f"live playback {played_frames} frames; buffered {len(frame_buffer)} frames"
+                    status = (
+                        f"live segment {played_segments} playing "
+                        f"({played_frames} frames shown/scheduled); buffered {len(segment_buffer)} segments"
+                    )
                 last_yield = now
-                yield latest, video, progress, status
+                final_video = video if final_video_pending else gr.skip()
+                final_video_pending = False
+                yield latest_segment, final_video, progress, status
             elif got_update or now - last_yield >= 0.5:
                 last_yield = now
-                yield latest, video, progress, status
+                final_video = video if final_video_pending else gr.skip()
+                final_video_pending = False
+                yield gr.skip(), final_video, progress, status
 
     css = """
     .gradio-container { max-width: 1180px !important; }
-    #preview img { object-fit: contain; }
+    #preview video { object-fit: contain; background: #050505; }
     .mp4-progress { border: 1px solid #333; border-radius: 6px; padding: 10px 12px; background: #161616; }
     .mp4-progress-top { display: flex; justify-content: space-between; font-weight: 600; margin-bottom: 8px; }
     .mp4-progress-bar { height: 10px; background: #2a2a2a; border-radius: 999px; overflow: hidden; }
@@ -736,7 +812,14 @@ def build_demo(args: argparse.Namespace, state: DemoState) -> gr.Blocks:
                 save_mp4 = gr.Checkbox(value=True, label="Save final MP4")
                 run = gr.Button("Generate", variant="primary")
             with gr.Column(scale=2):
-                preview = gr.Image(label="Live preview", elem_id="preview")
+                preview = gr.Video(
+                    label="Live preview",
+                    elem_id="preview",
+                    autoplay=True,
+                    include_audio=False,
+                    interactive=False,
+                    loop=False,
+                )
                 video = gr.Video(label="Final MP4")
                 mp4_progress = gr.HTML(
                     _progress_html(save_mp4=True, encoder="h264_nvenc", message="idle"),
