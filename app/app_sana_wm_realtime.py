@@ -222,7 +222,7 @@ class DemoState:
                 refiner=refiner,
                 offload_vae=False,
                 offload_refiner=False,
-                offload_text_encoder=False,
+                offload_text_encoder=True,
                 logger=logger,
             )
             if not self.no_compile:

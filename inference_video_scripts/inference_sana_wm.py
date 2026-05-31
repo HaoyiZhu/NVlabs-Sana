@@ -1264,21 +1264,39 @@ class SanaWMPipeline:
         else:
             max_length_all = max_length
 
+        text_encoder_on_target = True
+        try:
+            text_encoder_device = next(self.text_encoder.parameters()).device
+            target_device = torch.device(self.device)
+            text_encoder_on_target = text_encoder_device.type == target_device.type and (
+                target_device.type != "cuda"
+                or target_device.index is None
+                or text_encoder_device.index == target_device.index
+            )
+        except StopIteration:
+            pass
+
+        move_text_encoder_for_encode = self.offload_text_encoder or not text_encoder_on_target
+        if move_text_encoder_for_encode:
+            self.text_encoder.to(self.device)
+
         def encode(text: str, length: int) -> tuple[torch.Tensor, torch.Tensor]:
-            if self.offload_text_encoder:
-                self.text_encoder.to(self.device)
             tok = self.tokenizer(
                 [text], max_length=length, padding="max_length", truncation=True, return_tensors="pt"
             ).to(self.device)
             return self.text_encoder(tok.input_ids, tok.attention_mask)[0], tok.attention_mask
 
-        cond, cond_mask = encode(prompt, max_length_all)
-        select = [0] + list(range(-max_length + 1, 0))
-        cond = cond[:, None][:, :, select]
-        cond_mask = cond_mask[:, select]
-        neg, neg_mask = encode(negative_prompt, max_length)
-        self._offload_text_encoder()
-        return cond, cond_mask, neg[:, None], neg_mask
+        try:
+            cond, cond_mask = encode(prompt, max_length_all)
+            select = [0] + list(range(-max_length + 1, 0))
+            cond = cond[:, None][:, :, select]
+            cond_mask = cond_mask[:, select]
+            neg, neg_mask = encode(negative_prompt, max_length)
+            return cond, cond_mask, neg[:, None], neg_mask
+        finally:
+            if move_text_encoder_for_encode:
+                self.text_encoder.to("cpu")
+                torch.cuda.empty_cache()
 
     def _pad_stage1_text_for_nvfp4(
         self,
@@ -1360,6 +1378,9 @@ class SanaWMPipeline:
         # prepared-cache models, release them and reload from cache after encoding.
         dropped_stage1 = False
         dropped_refiner = False
+        stage1_text_encoder = getattr(self, "text_encoder", None)
+        if stage1_text_encoder is not None:
+            stage1_text_encoder.to("cpu")
         if getattr(self.model, "_sana_wm_stage1_nvfp4_converted", False):
             model = self.model
             self.model = None
