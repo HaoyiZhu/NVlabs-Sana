@@ -1370,10 +1370,12 @@ class SanaWMPipeline:
         output_path: str | Path,
         streaming_crf: int = 18,
         streaming_preset: str = "medium",
+        streaming_encoder: str = "libx264",
         output_mode: str = "mp4",
         profile_cuda: bool = False,
         sample_frames_path: str | Path | None = None,
         sample_frame_stride: int = 0,
+        decoded_chunk_callback=None,
     ) -> dict[str, object]:
         """Chunk-pipelined interactive generation.
 
@@ -1594,6 +1596,7 @@ class SanaWMPipeline:
             output_path=output_path,
             mp4_crf=int(streaming_crf),
             mp4_preset=str(streaming_preset),
+            mp4_encoder=str(streaming_encoder),
             drop_first_pixel=True,
             output_mode=output_mode,
             profile_cuda=bool(profile_cuda),
@@ -1603,6 +1606,7 @@ class SanaWMPipeline:
             sequential_offload=sequential_offload,
             stage1_done_callback=_offload_stage1_after_streaming_sample if sequential_offload else None,
             stage1_chunk_ends=stage1_chunk_indices[1:],
+            decoded_chunk_callback=decoded_chunk_callback,
         )
         result = run_streaming_inference(
             stage1_chunk_iter=stage1_iter,

@@ -49,6 +49,7 @@ class StreamingPipelineConfig:
     output_path: str | Path = "streaming_output.mp4"
     mp4_crf: int = 18
     mp4_preset: str = "medium"
+    mp4_encoder: str = "libx264"
     drop_first_pixel: bool = True
     output_mode: str = "mp4"
     profile_cuda: bool = False
@@ -58,6 +59,7 @@ class StreamingPipelineConfig:
     sequential_offload: bool = False
     stage1_done_callback: Callable[[], None] | None = None
     stage1_chunk_ends: tuple[int, ...] | None = None
+    decoded_chunk_callback: Callable[[np.ndarray, int, int], None] | None = None
 
 
 @dataclass
@@ -252,6 +254,7 @@ def run_streaming_inference(
             fps=int(config.fps),
             crf=int(config.mp4_crf),
             preset=str(config.mp4_preset),
+            encoder=str(config.mp4_encoder),
         )
 
     n_pixel_frames = 0
@@ -461,6 +464,8 @@ def run_streaming_inference(
                         pixel_np = pixel_np[1:]
                     n_frames = int(pixel_np.shape[0])
                     _collect_sample_frames(pixel_np, n_pixel_frames)
+                    if config.decoded_chunk_callback is not None and n_frames > 0:
+                        config.decoded_chunk_callback(pixel_np, n_pixel_frames, int(_k))
                     if output_mode == "mp4":
                         assert writer is not None
                         writer.write_chunk(pixel_np)
@@ -485,6 +490,8 @@ def run_streaming_inference(
                     pixel_np = pixel_np[1:]
                 n_frames = int(pixel_np.shape[0])
                 _collect_sample_frames(pixel_np, n_pixel_frames)
+                if config.decoded_chunk_callback is not None and n_frames > 0:
+                    config.decoded_chunk_callback(pixel_np, n_pixel_frames, int(_k))
                 if output_mode == "mp4":
                     assert writer is not None
                     writer.write_chunk(pixel_np)
@@ -609,6 +616,7 @@ def _run_streaming_inference_sequential(
             fps=int(config.fps),
             crf=int(config.mp4_crf),
             preset=str(config.mp4_preset),
+            encoder=str(config.mp4_encoder),
         )
 
     sample_frames: list[np.ndarray] = []
@@ -715,6 +723,8 @@ def _run_streaming_inference_sequential(
                     pixel_np = pixel_np[1:]
                 n_frames = int(pixel_np.shape[0])
                 _collect_sample_frames(pixel_np, n_pixel_frames)
+                if config.decoded_chunk_callback is not None and n_frames > 0:
+                    config.decoded_chunk_callback(pixel_np, n_pixel_frames, int(k_dec))
                 if output_mode == "mp4":
                     assert writer is not None
                     writer.write_chunk(pixel_np)

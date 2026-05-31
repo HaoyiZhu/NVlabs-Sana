@@ -140,6 +140,8 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="ffmpeg CRF for the progressive MP4 (lower = higher quality).")
     p.add_argument("--streaming_preset", default="medium",
                    help="ffmpeg libx264 preset for the progressive MP4 writer.")
+    p.add_argument("--streaming_encoder", default=os.environ.get("SANA_WM_STREAMING_MP4_ENCODER", "libx264"),
+                   help="MP4 encoder: libx264 or h264_nvenc.")
     p.add_argument("--output_mode", choices=["mp4", "cpu", "discard"], default="mp4",
                    help="mp4 writes H.264, cpu copies decoded uint8 frames to host without writing, discard decodes on GPU and drops frames after synchronization.")
     p.add_argument("--no_mp4", action="store_true",
@@ -349,6 +351,7 @@ def main() -> None:
             output_path=streaming_path,
             streaming_crf=args.streaming_crf,
             streaming_preset=args.streaming_preset,
+            streaming_encoder=args.streaming_encoder,
             output_mode=output_mode,
             profile_cuda=args.profile_cuda,
             sample_frames_path=sample_frames_path,
@@ -398,6 +401,7 @@ def main() -> None:
                 "PRECISION_OVERRIDE",
                 "PYTORCH_CUDA_ALLOC_CONF",
                 "SANA_WM_STREAMING_PROMPT_CACHE",
+                "SANA_WM_STREAMING_MP4_ENCODER",
                 "SANA_WM_STREAMING_PREDECODE_SINK",
                 "SANA_WM_STREAMING_DIRECT_REFINED_BLOCKS",
                 "SANA_WM_STREAMING_REFINER_FIRST",
@@ -470,6 +474,7 @@ def main() -> None:
             "num_frame_per_block": int(args.num_frame_per_block),
             "refiner_block_size": int(args.refiner_block_size),
             "refiner_kv_max_frames": int(args.refiner_kv_max_frames),
+            "streaming_encoder": str(args.streaming_encoder),
             "num_cached_blocks": int(args.num_cached_blocks),
             "torch_compile": not bool(args.no_compile),
             "profile_cuda": bool(args.profile_cuda),
