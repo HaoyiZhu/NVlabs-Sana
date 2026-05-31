@@ -24,6 +24,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterator
+import os
 import time
 
 import numpy as np
@@ -32,6 +33,10 @@ import torch
 from diffusion.model.ltx2 import CausalVaeStreamingDecoder
 from diffusion.refiner.diffusers_ltx2_refiner import RefinerChunkRunner
 from inference_video_scripts.streaming_mp4_writer import StreamingMp4Writer
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 @dataclass
@@ -183,6 +188,9 @@ def run_streaming_inference(
     latents_full[:, :, :sink_size] = z_init[:, :, :sink_size]
     refined_full = torch.empty_like(z_init)
     refined_full[:, :, :sink_size] = z_init[:, :, :sink_size]
+    predecode_sink = _env_flag("SANA_WM_STREAMING_PREDECODE_SINK") and sink_size > 0
+    direct_refined_blocks = _env_flag("SANA_WM_STREAMING_DIRECT_REFINED_BLOCKS") and predecode_sink
+    refined_blocks: list[torch.Tensor | None] | None = [None] * n_refiner if direct_refined_blocks else None
 
     device = z_init.device
     stage1_stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
@@ -208,6 +216,15 @@ def run_streaming_inference(
         if stream is not None and event is not None:
             stream.wait_event(event)
 
+    mark_cudagraph_step = _env_flag("SANA_WM_CUDAGRAPH_MARK_STEP")
+
+    def _mark_step_begin():
+        if not mark_cudagraph_step:
+            return
+        mark_fn = getattr(getattr(torch, "compiler", None), "cudagraph_mark_step_begin", None)
+        if mark_fn is not None:
+            mark_fn()
+
     stage1_events = [_new_event() for _ in range(n_stage1_chunks)]
     refiner_events = [_new_event() for _ in range(n_refiner)]
     decode_events = [_new_event() for _ in range(n_decode)]
@@ -223,6 +240,7 @@ def run_streaming_inference(
             decoder.to("cpu")
             torch.cuda.empty_cache()
             decoder_on_device = False
+    predecoded_sink = False
 
     pending: deque[tuple[torch.cuda.Event | None, torch.Tensor | int, int]] = deque()
     writer = None
@@ -253,10 +271,61 @@ def run_streaming_inference(
                 sample_frames.append(pixel_np[local_idx].copy())
                 sample_frame_indices.append(frame_idx)
 
-    t_start = time.perf_counter()
+    def _sample_discard_frames(pixel_chunk: torch.Tensor, frame_base: int, drop_first: bool) -> None:
+        if sample_frames_path is None:
+            return
+        drop = 1 if drop_first else 0
+        n_out = max(0, int(pixel_chunk.shape[2]) - drop)
+        local_indices = [i for i in range(n_out) if (frame_base + i) % sample_frame_stride == 0]
+        if not local_indices:
+            return
+        src_indices = torch.as_tensor(
+            [drop + i for i in local_indices],
+            device=pixel_chunk.device,
+            dtype=torch.long,
+        )
+        selected = pixel_chunk.index_select(2, src_indices)
+        pixel_uint8 = (selected.float() * 127.5 + 127.5).clamp(0, 255).to(torch.uint8)
+        pixel_np = pixel_uint8.permute(0, 2, 3, 4, 1).contiguous().to("cpu", non_blocking=True).numpy()[0]
+        for frame, local_idx in zip(pixel_np, local_indices, strict=True):
+            sample_frames.append(frame.copy())
+            sample_frame_indices.append(int(frame_base + local_idx))
+
+    t_start: float | None = None
     first_chunk_seconds: float | None = None
     first_chunk_frames: int | None = None
     try:
+        if predecode_sink:
+            # Seed the causal VAE decoder cache with the non-output sink latent.
+            # This is equivalent to decoding [sink + block0] and dropping the
+            # sink pixel, but lets the timed stream decode only output frames.
+            decoder = getattr(vae_streaming_decoder.vae, "decoder", None)
+            if decoder is not None and not decoder_on_device:
+                decoder.to(device)
+                decoder_on_device = True
+            with _on(decode_stream):
+                _mark_step_begin()
+                _ = vae_streaming_decoder.decode_chunk(refined_full[:, :, :sink_size])
+            if decode_stream is not None:
+                decode_stream.synchronize()
+            predecoded_sink = True
+            if bool(config.lazy_vae_decoder) and device.type == "cuda" and decoder is not None:
+                decoder.to("cpu")
+                torch.cuda.empty_cache()
+                decoder_on_device = False
+
+        t_start = time.perf_counter()
+        if _env_flag("SANA_WM_REFINER_PRECAPTURE_SINK") and sink_size > 0:
+            with _on(refiner_stream):
+                timing_start = _new_timing_event()
+                timing_end = _new_timing_event()
+                _record(timing_start, refiner_stream)
+                _mark_step_begin()
+                refiner_runner.pre_capture_sink(latents_full[:, :, :sink_size])
+                _record(timing_end, refiner_stream)
+                if timing_start is not None and timing_end is not None:
+                    refiner_timing_events.append((timing_start, timing_end))
+
         # Schedule per timestep:
         #   t=0:  stage1[0]
         #   t=1:  stage1[1], refiner[0]
@@ -265,8 +334,97 @@ def run_streaming_inference(
         t = 0
         next_ref = 0
         next_dec = 0
+        refiner_first = _env_flag("SANA_WM_STREAMING_REFINER_FIRST")
+        decode_current = _env_flag("SANA_WM_STREAMING_DECODE_CURRENT")
+
+        def _try_launch_refiner(max_ready_stage_idx: int) -> bool:
+            nonlocal next_ref
+            if next_ref >= n_refiner or refiner_ready_stage_idx[next_ref] > max_ready_stage_idx:
+                return False
+
+            k_ref = next_ref
+            _wait(refiner_stream, stage1_events[refiner_ready_stage_idx[k_ref]])
+            block_start = sink_size + k_ref * block_size
+            block_end = block_start + block_size
+            with _on(refiner_stream):
+                timing_start = _new_timing_event()
+                timing_end = _new_timing_event()
+                _record(timing_start, refiner_stream)
+                clean_block = latents_full[:, :, block_start:block_end]
+                sink_seed = latents_full[:, :, :sink_size] if k_ref == 0 else None
+                _mark_step_begin()
+                refined_block = refiner_runner.refine_block(
+                    block_idx=k_ref,
+                    clean_block=clean_block,
+                    block_start=block_start,
+                    block_end=block_end,
+                    sink_seed_frames=sink_seed,
+                )
+                if refined_blocks is not None:
+                    refined_blocks[k_ref] = refined_block
+                else:
+                    refined_full[:, :, block_start:block_end].copy_(refined_block, non_blocking=True)
+                _record(timing_end, refiner_stream)
+                if timing_start is not None and timing_end is not None:
+                    refiner_timing_events.append((timing_start, timing_end))
+            _record(refiner_events[k_ref], refiner_stream)
+            next_ref += 1
+            return True
+
+        def _try_launch_decode(max_refiner_idx_exclusive: int) -> bool:
+            nonlocal decoder_on_device, next_dec
+            if next_dec >= n_decode or next_dec >= max_refiner_idx_exclusive:
+                return False
+
+            k_dec = next_dec
+            _wait(decode_stream, refiner_events[k_dec])
+            if refined_blocks is not None:
+                z_slice = refined_blocks[k_dec]
+                if z_slice is None:
+                    raise RuntimeError(f"Refined block {k_dec} was not produced before decode launch.")
+            elif k_dec == 0 and predecoded_sink:
+                z_slice = refined_full[:, :, sink_size : sink_size + block_size]
+            elif k_dec == 0:
+                z_slice = refined_full[:, :, : sink_size + block_size]
+            else:
+                z_slice = refined_full[
+                    :, :, sink_size + k_dec * block_size : sink_size + (k_dec + 1) * block_size
+                ]
+            with _on(decode_stream):
+                timing_start = _new_timing_event()
+                timing_end = _new_timing_event()
+                _record(timing_start, decode_stream)
+                if not decoder_on_device:
+                    decoder = getattr(vae_streaming_decoder.vae, "decoder", None)
+                    if decoder is not None:
+                        decoder.to(device)
+                        decoder_on_device = True
+                _mark_step_begin()
+                pixel_chunk = vae_streaming_decoder.decode_chunk(z_slice)
+                if output_mode == "discard":
+                    n_frames = int(pixel_chunk.shape[2])
+                    drop_first = bool(k_dec == 0 and config.drop_first_pixel and not predecoded_sink)
+                    if drop_first:
+                        n_frames -= 1
+                    _sample_discard_frames(pixel_chunk, n_pixel_frames, drop_first)
+                    pixel_out = max(0, n_frames)
+                else:
+                    pixel_uint8 = (pixel_chunk.float() * 127.5 + 127.5).clamp(0, 255).to(torch.uint8)
+                    pixel_hwc = pixel_uint8.permute(0, 2, 3, 4, 1).contiguous()
+                    pixel_out = pixel_hwc.to("cpu", non_blocking=True)
+                _record(timing_end, decode_stream)
+                if timing_start is not None and timing_end is not None:
+                    decode_timing_events.append((timing_start, timing_end))
+            _record(decode_events[k_dec], decode_stream)
+            pending.append((decode_events[k_dec], pixel_out, k_dec))
+            next_dec += 1
+            return True
 
         while t < n_stage1_chunks or next_ref < n_refiner or next_dec < n_decode:
+            refiner_launched_before = next_ref
+            if refiner_first:
+                _try_launch_refiner(t - 1)
+
             # --- stage-1 chunk t ---
             if t < n_stage1_chunks:
                 with _on(stage1_stream):
@@ -281,81 +439,25 @@ def run_streaming_inference(
                 _record(stage1_events[t], stage1_stream)
 
             # --- refiner block t - 1 ---
-            refiner_launched_before = next_ref
-            if next_ref < n_refiner and refiner_ready_stage_idx[next_ref] <= min(t, n_stage1_chunks - 1):
-                k_ref = next_ref
-                _wait(refiner_stream, stage1_events[refiner_ready_stage_idx[k_ref]])
-                block_start = sink_size + k_ref * block_size
-                block_end = block_start + block_size
-                with _on(refiner_stream):
-                    timing_start = _new_timing_event()
-                    timing_end = _new_timing_event()
-                    _record(timing_start, refiner_stream)
-                    clean_block = latents_full[:, :, block_start:block_end]
-                    sink_seed = latents_full[:, :, :sink_size] if k_ref == 0 else None
-                    refined_block = refiner_runner.refine_block(
-                        block_idx=k_ref,
-                        clean_block=clean_block,
-                        block_start=block_start,
-                        block_end=block_end,
-                        sink_seed_frames=sink_seed,
-                    )
-                    refined_full[:, :, block_start:block_end].copy_(refined_block, non_blocking=True)
-                    _record(timing_end, refiner_stream)
-                    if timing_start is not None and timing_end is not None:
-                        refiner_timing_events.append((timing_start, timing_end))
-                _record(refiner_events[k_ref], refiner_stream)
-                next_ref += 1
+            if not refiner_first or refiner_launched_before == next_ref:
+                _try_launch_refiner(min(t, n_stage1_chunks - 1))
 
             # --- decode chunk t - 2 ---
-            if next_dec < n_decode and next_dec < refiner_launched_before:
-                k_dec = next_dec
-                _wait(decode_stream, refiner_events[k_dec])
-                if k_dec == 0:
-                    z_slice = refined_full[:, :, : sink_size + block_size]
-                else:
-                    z_slice = refined_full[
-                        :, :, sink_size + k_dec * block_size : sink_size + (k_dec + 1) * block_size
-                    ]
-                with _on(decode_stream):
-                    timing_start = _new_timing_event()
-                    timing_end = _new_timing_event()
-                    _record(timing_start, decode_stream)
-                    if not decoder_on_device:
-                        decoder = getattr(vae_streaming_decoder.vae, "decoder", None)
-                        if decoder is not None:
-                            decoder.to(device)
-                            decoder_on_device = True
-                    pixel_chunk = vae_streaming_decoder.decode_chunk(z_slice)
-                    if output_mode == "discard":
-                        n_frames = int(pixel_chunk.shape[2])
-                        if k_dec == 0 and config.drop_first_pixel:
-                            n_frames -= 1
-                        pixel_out = max(0, n_frames)
-                    else:
-                        pixel_uint8 = (
-                            (pixel_chunk.float() * 127.5 + 127.5).clamp(0, 255).to(torch.uint8)
-                        )
-                        pixel_hwc = pixel_uint8.permute(0, 2, 3, 4, 1).contiguous()
-                        pixel_out = pixel_hwc.to("cpu", non_blocking=True)
-                    _record(timing_end, decode_stream)
-                    if timing_start is not None and timing_end is not None:
-                        decode_timing_events.append((timing_start, timing_end))
-                _record(decode_events[k_dec], decode_stream)
-                pending.append((decode_events[k_dec], pixel_out, k_dec))
-                next_dec += 1
+            decode_ready_ref = next_ref if decode_current else refiner_launched_before
+            _try_launch_decode(decode_ready_ref)
 
             # --- Flush any ready decoded chunks. In discard mode this only
             # retires the CUDA work; no CPU copy or encoder path is exercised.
             while pending and (pending[0][0] is None or pending[0][0].query()):
                 _event, _pixel_out, _k = pending.popleft()
                 if first_chunk_seconds is None:
+                    assert t_start is not None
                     first_chunk_seconds = time.perf_counter() - t_start
                 if output_mode == "discard":
                     n_frames = int(_pixel_out)
                 else:
                     pixel_np = _pixel_out.numpy()[0]
-                    if _k == 0 and config.drop_first_pixel:
+                    if _k == 0 and config.drop_first_pixel and not predecoded_sink:
                         pixel_np = pixel_np[1:]
                     n_frames = int(pixel_np.shape[0])
                     _collect_sample_frames(pixel_np, n_pixel_frames)
@@ -373,12 +475,13 @@ def run_streaming_inference(
             if _event is not None:
                 _event.synchronize()
             if first_chunk_seconds is None:
+                assert t_start is not None
                 first_chunk_seconds = time.perf_counter() - t_start
             if output_mode == "discard":
                 n_frames = int(_pixel_out)
             else:
                 pixel_np = _pixel_out.numpy()[0]
-                if _k == 0 and config.drop_first_pixel:
+                if _k == 0 and config.drop_first_pixel and not predecoded_sink:
                     pixel_np = pixel_np[1:]
                 n_frames = int(pixel_np.shape[0])
                 _collect_sample_frames(pixel_np, n_pixel_frames)
@@ -407,6 +510,7 @@ def run_streaming_inference(
             writer.close()
         raise
 
+    assert t_start is not None
     wall_seconds = time.perf_counter() - t_start
     frames_per_second = float(n_pixel_frames) / wall_seconds if wall_seconds > 0.0 else 0.0
     realtime_factor = frames_per_second / float(config.fps) if config.fps else 0.0
@@ -521,6 +625,26 @@ def _run_streaming_inference_sequential(
                 sample_frames.append(pixel_np[local_idx].copy())
                 sample_frame_indices.append(frame_idx)
 
+    def _sample_discard_frames(pixel_chunk: torch.Tensor, frame_base: int, drop_first: bool) -> None:
+        if sample_frames_path is None:
+            return
+        drop = 1 if drop_first else 0
+        n_out = max(0, int(pixel_chunk.shape[2]) - drop)
+        local_indices = [i for i in range(n_out) if (frame_base + i) % sample_frame_stride == 0]
+        if not local_indices:
+            return
+        src_indices = torch.as_tensor(
+            [drop + i for i in local_indices],
+            device=pixel_chunk.device,
+            dtype=torch.long,
+        )
+        selected = pixel_chunk.index_select(2, src_indices)
+        pixel_uint8 = (selected.float() * 127.5 + 127.5).clamp(0, 255).to(torch.uint8)
+        pixel_np = pixel_uint8.permute(0, 2, 3, 4, 1).contiguous().to("cpu", non_blocking=True).numpy()[0]
+        for frame, local_idx in zip(pixel_np, local_indices, strict=True):
+            sample_frames.append(frame.copy())
+            sample_frame_indices.append(int(frame_base + local_idx))
+
     t_start = time.perf_counter()
     stage1_t0 = time.perf_counter()
     first_chunk_seconds: float | None = None
@@ -544,6 +668,10 @@ def _run_streaming_inference_sequential(
             block_end = block_start + block_size
             clean_block = latents_full[:, :, block_start:block_end]
             sink_seed = latents_full[:, :, :sink_size] if k_ref == 0 else None
+            if _env_flag("SANA_WM_CUDAGRAPH_MARK_STEP"):
+                mark_fn = getattr(getattr(torch, "compiler", None), "cudagraph_mark_step_begin", None)
+                if mark_fn is not None:
+                    mark_fn()
             refined_block = refiner_runner.refine_block(
                 block_idx=k_ref,
                 clean_block=clean_block,
@@ -569,11 +697,17 @@ def _run_streaming_inference_sequential(
                 z_slice = refined_full[
                     :, :, sink_size + k_dec * block_size : sink_size + (k_dec + 1) * block_size
                 ]
+            if _env_flag("SANA_WM_CUDAGRAPH_MARK_STEP"):
+                mark_fn = getattr(getattr(torch, "compiler", None), "cudagraph_mark_step_begin", None)
+                if mark_fn is not None:
+                    mark_fn()
             pixel_chunk = vae_streaming_decoder.decode_chunk(z_slice)
             if output_mode == "discard":
                 n_frames = int(pixel_chunk.shape[2])
-                if k_dec == 0 and config.drop_first_pixel:
+                drop_first = bool(k_dec == 0 and config.drop_first_pixel)
+                if drop_first:
                     n_frames -= 1
+                _sample_discard_frames(pixel_chunk, n_pixel_frames, drop_first)
             else:
                 pixel_uint8 = (pixel_chunk.float() * 127.5 + 127.5).clamp(0, 255).to(torch.uint8)
                 pixel_np = pixel_uint8.permute(0, 2, 3, 4, 1).contiguous().to("cpu").numpy()[0]

@@ -151,7 +151,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--profile_cuda", action="store_true",
                    help="Record per-stage CUDA event timings; useful for bottleneck breakdown but disabled by default for pure throughput.")
     p.add_argument("--sample_frames_npz", type=Path, default=None,
-                   help="Optional .npz path for sampled decoded uint8 frames in cpu/mp4 mode.")
+                   help="Optional .npz path for sampled decoded uint8 frames.")
     p.add_argument("--sample_frame_stride", type=int, default=16,
                    help="Save every Nth output frame when --sample_frames_npz is set.")
     p.add_argument("--no_compile", action="store_true",
@@ -267,16 +267,33 @@ def main() -> None:
         # Numerically-equivalent compile (default Inductor mode, no CUDA-graph
         # capture, no fp32->fp16 substitution). Cold compile takes ~3 min the
         # first time; subsequent runs reuse the Inductor cache.
+        compile_mode = os.environ.get("SANA_WM_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs").strip()
+        compile_dynamic_raw = os.environ.get("SANA_WM_TORCH_COMPILE_DYNAMIC", "1").strip().lower()
+        compile_dynamic = compile_dynamic_raw not in {"0", "false", "no", "off"}
+        compile_targets_raw = os.environ.get("SANA_WM_TORCH_COMPILE_TARGETS", "vae,refiner")
+        compile_targets = {
+            item.strip().lower()
+            for item in compile_targets_raw.replace("+", ",").split(",")
+            if item.strip()
+        }
+        unsupported_targets = compile_targets - {"vae", "refiner"}
+        if unsupported_targets:
+            raise SystemExit(
+                "SANA_WM_TORCH_COMPILE_TARGETS only supports 'vae' and 'refiner'; "
+                f"got {sorted(unsupported_targets)}."
+            )
         logger.info(
-            "[streaming] torch.compile(vae.decoder + refiner.transformer, "
-            "mode='max-autotune-no-cudagraphs')"
+            "[streaming] torch.compile("
+            f"targets={sorted(compile_targets)}, mode={compile_mode!r}, dynamic={compile_dynamic})"
         )
-        pipeline.vae.decoder = torch.compile(
-            pipeline.vae.decoder, mode="max-autotune-no-cudagraphs", dynamic=True
-        )
-        pipeline.refiner.transformer = torch.compile(
-            pipeline.refiner.transformer, mode="max-autotune-no-cudagraphs", dynamic=True
-        )
+        if "vae" in compile_targets:
+            pipeline.vae.decoder = torch.compile(
+                pipeline.vae.decoder, mode=compile_mode, dynamic=compile_dynamic
+            )
+        if "refiner" in compile_targets:
+            pipeline.refiner.transformer = torch.compile(
+                pipeline.refiner.transformer, mode=compile_mode, dynamic=compile_dynamic
+            )
 
     denoising_step_list = [int(t.strip()) for t in args.denoising_step_list.split(",") if t.strip()]
     if not denoising_step_list or denoising_step_list[-1] != 0:
@@ -301,8 +318,6 @@ def main() -> None:
     if args.no_mp4 and args.output_mode not in {"mp4", "discard"}:
         raise SystemExit("--no_mp4 cannot be combined with --output_mode=cpu.")
     output_mode = "discard" if args.no_mp4 else args.output_mode
-    if args.sample_frames_npz is not None and output_mode == "discard":
-        raise SystemExit("--sample_frames_npz requires --output_mode=cpu or --output_mode=mp4.")
     if args.sample_frames_npz is not None and args.sample_frame_stride < 1:
         raise SystemExit("--sample_frame_stride must be >= 1.")
 
@@ -383,6 +398,10 @@ def main() -> None:
                 "PRECISION_OVERRIDE",
                 "PYTORCH_CUDA_ALLOC_CONF",
                 "SANA_WM_STREAMING_PROMPT_CACHE",
+                "SANA_WM_STREAMING_PREDECODE_SINK",
+                "SANA_WM_STREAMING_DIRECT_REFINED_BLOCKS",
+                "SANA_WM_STREAMING_REFINER_FIRST",
+                "SANA_WM_STREAMING_DECODE_CURRENT",
                 "SANA_WM_STAGE1_NVFP4",
                 "SANA_WM_STAGE1_NVFP4_MODE",
                 "SANA_WM_STAGE1_NVFP4_INCLUDE_PATTERNS",
@@ -390,17 +409,35 @@ def main() -> None:
                 "SANA_WM_STAGE1_NVFP4_TEXT_PAD_MULTIPLE",
                 "SANA_WM_STAGE1_LINEARIZE_FFN",
                 "SANA_WM_STAGE1_KV_SAVE_STRIDE",
+                "SANA_WM_SDPA_D112_DIRECT",
                 "SANA_WM_REFINER_NVFP4",
                 "SANA_WM_REFINER_ATTN_BACKEND",
                 "SANA_WM_REFINER_SELF_ATTN_KERNEL",
                 "SANA_WM_REFINER_PRECONCAT_PREFIX",
                 "SANA_WM_REFINER_KV_CACHE_DTYPE",
+                "SANA_WM_REFINER_CAPTURE_KV_ONLY_LAST",
+                "SANA_WM_REFINER_FUSE_SELF_QKV",
+                "SANA_WM_REFINER_FAST_KV_CAPTURE",
+                "SANA_WM_REFINER_PREGENERATE_NOISE",
+                "SANA_WM_REFINER_TIMESTEP_CACHE",
+                "SANA_WM_REFINER_FAST_KV_CLEAN_INTERVAL",
+                "SANA_WM_REFINER_HISTORY_LAYERS",
+                "SANA_WM_REFINER_HISTORY_LAYER_STRIDE",
+                "SANA_WM_REFINER_HISTORY_LAYER_OFFSET",
+                "SANA_WM_REFINER_HISTORY_KEEP_LAST",
                 "SANA_WM_REFINER_CROSS_ATTN_KV_CACHE",
                 "SANA_WM_REFINER_EMPTY_CACHE_BEFORE_PREFIX",
+                "SANA_WM_REFINER_EMPTY_CACHE_BEFORE_CAPTURE",
+                "SANA_WM_REFINER_PROFILE",
+                "SANA_WM_REFINER_LAYER_PROFILE",
                 "SANA_WM_REFINER_NVFP4_OFFLOAD_STAGE1",
                 "SANA_WM_REFINER_NVFP4_OFFLOAD_VAE",
                 "SANA_WM_TE_NVFP4_CPU_STAGING",
                 "SANA_WM_STREAMING_LAZY_VAE_DECODER",
+                "SANA_WM_TORCH_COMPILE_MODE",
+                "SANA_WM_TORCH_COMPILE_DYNAMIC",
+                "SANA_WM_TORCH_COMPILE_TARGETS",
+                "SANA_WM_CUDAGRAPH_MARK_STEP",
             )
             if os.environ.get(name) is not None
         }

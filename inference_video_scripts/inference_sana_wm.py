@@ -1579,6 +1579,9 @@ class SanaWMPipeline:
             kv_max_frames=int(self.refiner_settings.kv_max_frames),
             seed=int(self.refiner_settings.seed),
             spatial_shape=(int(z.shape[3]), int(z.shape[4])),
+            n_active_frames=max(int(z.shape[2]) - int(self.refiner_settings.sink_size), 0),
+            latent_channels=int(z.shape[1]),
+            batch_size=int(z.shape[0]),
         )
 
         # Causal VAE streaming decoder.
