@@ -26,6 +26,7 @@ os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", str(Path.home() / ".cache" / "s
 os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
 os.environ.setdefault("SANA_WM_PREPARED_MODULE_CACHE", "1")
 os.environ.setdefault("SANA_WM_PREPARED_MODULE_CACHE_DIR", str(Path.home() / ".cache" / "sana_wm_prepared_modules"))
+os.environ.setdefault("SANA_WM_LIVE_SEGMENT_ENCODER", "libx264")
 if "--cuda_visible_devices" in sys.argv:
     idx = sys.argv.index("--cuda_visible_devices")
     if idx + 1 < len(sys.argv):
@@ -315,7 +316,7 @@ def _encode_chunk_mp4(
     fps: int,
     encoder: str,
 ) -> Path:
-    preset = "p4" if str(encoder).strip().lower() == "h264_nvenc" else "veryfast"
+    preset = "p4" if str(encoder).strip().lower() == "h264_nvenc" else "ultrafast"
     writer = StreamingMp4Writer(
         output_path,
         height=int(frames.shape[1]),
@@ -533,7 +534,12 @@ def build_demo(args: argparse.Namespace, state: DemoState) -> gr.Blocks:
             segment_dir = segment_dir_ref["path"]
             if segment_dir is None:
                 return
-            encode_jobs.put((pixel_np.copy(), int(frame_base), int(chunk_idx), segment_dir, selected_encoder))
+            live_encoder = os.environ.get("SANA_WM_LIVE_SEGMENT_ENCODER", "libx264").strip().lower()
+            if live_encoder in {"", "same"}:
+                live_encoder = selected_encoder
+            elif live_encoder not in {"h264_nvenc", "libx264"}:
+                live_encoder = "libx264"
+            encode_jobs.put((pixel_np.copy(), int(frame_base), int(chunk_idx), segment_dir, live_encoder))
 
         def on_progress(event: dict[str, object]) -> None:
             put_update("progress", dict(event))
@@ -636,9 +642,13 @@ def build_demo(args: argparse.Namespace, state: DemoState) -> gr.Blocks:
                     },
                 )
             except Exception:
-                put_update("error", traceback.format_exc())
+                error_text = traceback.format_exc()
+                print(error_text, flush=True)
+                put_update("error", error_text)
             finally:
                 encode_jobs.put(None)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
         encoder_thread = threading.Thread(target=segment_encoder, daemon=True)
         encoder_thread.start()

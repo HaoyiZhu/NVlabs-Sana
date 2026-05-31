@@ -39,6 +39,17 @@ def _env_flag(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _pixel_chunk_to_cpu_uint8(pixel_chunk: torch.Tensor) -> torch.Tensor:
+    if _env_flag("SANA_WM_STREAMING_GPU_PIXEL_CONVERT"):
+        pixel_uint8 = ((pixel_chunk + 1.0) * 127.5).clamp(0, 255).to(torch.uint8)
+        return pixel_uint8.permute(0, 2, 3, 4, 1).contiguous().to("cpu", non_blocking=True)
+
+    # Keep the large float->uint8 temporary off the 32GB 5090. The decoded
+    # chunk is copied to CPU as bf16/fp16 first, then converted for ffmpeg.
+    pixel_cpu = pixel_chunk.to("cpu", non_blocking=True).permute(0, 2, 3, 4, 1).contiguous()
+    return ((pixel_cpu.float() + 1.0) * 127.5).clamp(0, 255).to(torch.uint8)
+
+
 @dataclass
 class StreamingPipelineConfig:
     """Static settings for one streaming-inference call."""
@@ -262,16 +273,20 @@ def run_streaming_inference(
 
     pending: deque[tuple[torch.cuda.Event | None, torch.Tensor | int, int]] = deque()
     writer = None
-    if output_mode == "mp4":
-        writer = StreamingMp4Writer(
-            config.output_path,
-            height=int(pixel_h),
-            width=int(pixel_w),
-            fps=int(config.fps),
-            crf=int(config.mp4_crf),
-            preset=str(config.mp4_preset),
-            encoder=str(config.mp4_encoder),
-        )
+
+    def _get_writer() -> StreamingMp4Writer:
+        nonlocal writer
+        if writer is None:
+            writer = StreamingMp4Writer(
+                config.output_path,
+                height=int(pixel_h),
+                width=int(pixel_w),
+                fps=int(config.fps),
+                crf=int(config.mp4_crf),
+                preset=str(config.mp4_preset),
+                encoder=str(config.mp4_encoder),
+            )
+        return writer
 
     n_pixel_frames = 0
     sample_frames: list[np.ndarray] = []
@@ -441,9 +456,7 @@ def run_streaming_inference(
                     _sample_discard_frames(pixel_chunk, n_pixel_frames, drop_first)
                     pixel_out = max(0, n_frames)
                 else:
-                    pixel_uint8 = (pixel_chunk.float() * 127.5 + 127.5).clamp(0, 255).to(torch.uint8)
-                    pixel_hwc = pixel_uint8.permute(0, 2, 3, 4, 1).contiguous()
-                    pixel_out = pixel_hwc.to("cpu", non_blocking=True)
+                    pixel_out = _pixel_chunk_to_cpu_uint8(pixel_chunk)
                 _record(timing_end, decode_stream)
                 if timing_start is not None and timing_end is not None:
                     decode_timing_events.append((timing_start, timing_end))
@@ -526,8 +539,7 @@ def run_streaming_inference(
                     if config.decoded_chunk_callback is not None and n_frames > 0:
                         config.decoded_chunk_callback(pixel_np, n_pixel_frames, int(_k))
                     if output_mode == "mp4":
-                        assert writer is not None
-                        writer.write_chunk(pixel_np)
+                        _get_writer().write_chunk(pixel_np)
                 n_pixel_frames += n_frames
                 if first_chunk_frames is None:
                     first_chunk_frames = n_frames
@@ -563,8 +575,7 @@ def run_streaming_inference(
                 if config.decoded_chunk_callback is not None and n_frames > 0:
                     config.decoded_chunk_callback(pixel_np, n_pixel_frames, int(_k))
                 if output_mode == "mp4":
-                    assert writer is not None
-                    writer.write_chunk(pixel_np)
+                    _get_writer().write_chunk(pixel_np)
             n_pixel_frames += n_frames
             if first_chunk_frames is None:
                 first_chunk_frames = n_frames
