@@ -319,7 +319,7 @@ class StreamingTsSegmentWriter:
         fps: int,
         encoder: str,
         crf: int = 18,
-        segment_seconds: float = 0.5,
+        segment_seconds: float = 1.0,
     ) -> None:
         self.output_dir = output_dir.expanduser().resolve()
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -331,13 +331,24 @@ class StreamingTsSegmentWriter:
 
         encoder = str(encoder).strip().lower()
         if encoder in {"nvenc", "h264_nvenc"}:
-            codec_args = ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", str(int(crf)), "-b:v", "0"]
+            codec_args = [
+                "-c:v",
+                "h264_nvenc",
+                "-preset",
+                "p4",
+                "-cq",
+                str(int(crf)),
+                "-b:v",
+                "0",
+                "-bf",
+                "0",
+            ]
         elif encoder in {"x264", "cpu", "libx264"}:
-            codec_args = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", str(int(crf))]
+            codec_args = ["-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-crf", str(int(crf))]
         else:
             raise ValueError(f"Unsupported live TS encoder: {encoder!r}")
 
-        segment_seconds = max(0.25, float(segment_seconds))
+        segment_seconds = max(0.5, float(segment_seconds))
         gop = max(1, int(round(self._fps * segment_seconds)))
         self._cmd = [
             resolve_ffmpeg_exe(),
@@ -655,7 +666,7 @@ def build_demo(args: argparse.Namespace, state: DemoState) -> gr.Blocks:
         out_dir.mkdir(parents=True, exist_ok=True)
         output_path = out_dir / "sana_wm_realtime.mp4"
         segment_dir = out_dir / "live_ts"
-        segment_seconds = float(os.environ.get("SANA_WM_LIVE_SEGMENT_SECONDS", "0.5"))
+        segment_seconds = float(os.environ.get("SANA_WM_LIVE_SEGMENT_SECONDS", "1.0"))
         encode_jobs: queue.Queue[tuple[np.ndarray, int, int] | None] = queue.Queue(maxsize=8)
         encoded_chunks: list[Path] = []
         preview_failed = threading.Event()
@@ -838,6 +849,7 @@ def build_demo(args: argparse.Namespace, state: DemoState) -> gr.Blocks:
         video = None
         chunks_received = 0
         final_video_pending = False
+        live_stream_end_pending = False
         last_yield = time.perf_counter()
         progress_state: dict[str, object] = {
             "message": "queued",
@@ -851,7 +863,7 @@ def build_demo(args: argparse.Namespace, state: DemoState) -> gr.Blocks:
             message="queued",
         )
         status = "starting"
-        yield preview, video, progress, status
+        yield gr.skip(), gr.skip(), progress, status
         while thread.is_alive() or encoder_thread.is_alive() or not updates.empty():
             timeout = 0.1
             got_update = False
@@ -884,6 +896,7 @@ def build_demo(args: argparse.Namespace, state: DemoState) -> gr.Blocks:
                     result = value
                     video = result["path"]
                     final_video_pending = bool(video)
+                    live_stream_end_pending = True
                     progress_state.update(
                         {
                             "message": "complete",
@@ -909,6 +922,7 @@ def build_demo(args: argparse.Namespace, state: DemoState) -> gr.Blocks:
                 elif kind == "error":
                     status = str(value)
                     progress_state["message"] = "error"
+                    live_stream_end_pending = True
 
             if kind != "done":
                 progress = _progress_html(
@@ -924,7 +938,13 @@ def build_demo(args: argparse.Namespace, state: DemoState) -> gr.Blocks:
             now = time.perf_counter()
             if got_update or now - last_yield >= 0.5:
                 last_yield = now
-                live_video = preview if kind == "chunk" else gr.skip()
+                if kind == "chunk":
+                    live_video = preview
+                elif live_stream_end_pending:
+                    live_video = None
+                    live_stream_end_pending = False
+                else:
+                    live_video = gr.skip()
                 final_video = video if final_video_pending else gr.skip()
                 final_video_pending = False
                 yield live_video, final_video, progress, status
