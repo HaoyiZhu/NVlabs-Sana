@@ -459,6 +459,21 @@ def run_streaming_inference(
 
             # --- stage-1 chunk t ---
             if t < n_stage1_chunks:
+                if config.progress_callback is not None:
+                    config.progress_callback(
+                        {
+                            "phase": "stage1_running",
+                            "message": f"stage-1 chunk {t + 1}/{n_stage1_chunks} running",
+                            "stage1_done": t,
+                            "stage1_total": n_stage1_chunks,
+                            "refiner_done": next_ref,
+                            "refiner_total": n_refiner,
+                            "decode_done": next_dec,
+                            "decode_total": n_decode,
+                            "frames": n_pixel_frames,
+                            "output_mode": output_mode,
+                        }
+                    )
                 with _on(stage1_stream):
                     timing_start = _new_timing_event()
                     timing_end = _new_timing_event()
@@ -753,6 +768,17 @@ def _run_streaming_inference_sequential(
     out_path: Path | None = None
     try:
         for _ in range(n_stage1_chunks):
+            if config.progress_callback is not None:
+                config.progress_callback(
+                    {
+                        "phase": "stage1_running",
+                        "message": f"stage-1 chunk {_ + 1}/{n_stage1_chunks} running",
+                        "stage1_done": _,
+                        "stage1_total": n_stage1_chunks,
+                        "frames": n_pixel_frames,
+                        "output_mode": output_mode,
+                    }
+                )
             chunk_idx, latent_view, start_f, end_f = next(stage1_chunk_iter)
             latents_full[:, :, start_f:end_f].copy_(latent_view, non_blocking=True)
             if config.progress_callback is not None:

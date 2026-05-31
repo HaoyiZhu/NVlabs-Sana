@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 import traceback
+from collections import deque
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -21,6 +22,8 @@ if str(REPO_ROOT) not in sys.path:
 os.environ.setdefault("DISABLE_XFORMERS", "1")
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", str(Path.home() / ".cache" / "sana_wm_torchinductor"))
+os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
 if "--cuda_visible_devices" in sys.argv:
     idx = sys.argv.index("--cuda_visible_devices")
     if idx + 1 < len(sys.argv):
@@ -61,12 +64,12 @@ import torch  # noqa: E402
 from PIL import Image  # noqa: E402
 
 from diffusion.utils.logger import get_root_logger  # noqa: E402
+from diffusion.model.ltx2 import CausalVaeStreamingDecoder  # noqa: E402
 from inference_video_scripts.inference_sana_wm import (  # noqa: E402
     GenerationParams,
     InferenceConfig,
     RefinerSettings,
     SanaWMPipeline,
-    _snap_num_frames,
     action_string_to_c2w,
     load_intrinsics,
     resize_and_center_crop,
@@ -83,6 +86,8 @@ from inference_video_scripts.streaming_mp4_writer import resolve_ffmpeg_exe  # n
 TARGET_HEIGHT = 704
 TARGET_WIDTH = 1280
 DEFAULT_ACTION = "w-240,jw-120,w-240,lw-120,w-240"
+DEFAULT_FPS = 16
+DEFAULT_NUM_FRAMES = 961
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -116,6 +121,42 @@ def _ffmpeg_has_encoder(encoder: str) -> bool:
     except RuntimeError:
         return False
     return encoder in out
+
+
+def _env_enabled(name: str, default: str = "1") -> bool:
+    return os.environ.get(name, default).strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def _snap_streaming_num_frames(
+    n: int,
+    *,
+    upper_bound: int,
+    temporal_stride: int = 8,
+    sink_size: int = 1,
+    block_size: int = 3,
+) -> int:
+    """Snap to a frame count whose latent length fits whole refiner blocks."""
+    n = max(1, int(n))
+    upper_bound = max(1, int(upper_bound))
+    temporal_stride = max(1, int(temporal_stride))
+    sink_size = max(1, int(sink_size))
+    block_size = max(1, int(block_size))
+    upper_latent = (upper_bound - 1) // temporal_stride + 1
+    max_blocks = max(1, (upper_latent - sink_size) // block_size)
+    target_latent = ((n - 1) / float(temporal_stride)) + 1.0
+    target_blocks = max(1, int(round((target_latent - sink_size) / float(block_size))))
+
+    candidates = {1, max_blocks}
+    for k in range(target_blocks - 2, target_blocks + 3):
+        if 1 <= k <= max_blocks:
+            candidates.add(k)
+
+    def frames_for_blocks(k: int) -> int:
+        latent_t = sink_size + k * block_size
+        return min(upper_bound, (latent_t - 1) * temporal_stride + 1)
+
+    valid = [frames_for_blocks(k) for k in candidates]
+    return min(valid, key=lambda v: (abs(v - n), -v))
 
 
 def _resolve_streaming_paths(streaming_root: Path) -> tuple[Path, Path, Path, Path, Path]:
@@ -265,12 +306,80 @@ def _progress_html(
     """
 
 
+def _warmup_streaming_pipeline(pipeline: SanaWMPipeline, prompt: str) -> None:
+    if not _env_enabled("SANA_WM_DEMO_PREWARM_STREAM", "1"):
+        return
+    c2w_full = action_string_to_c2w(
+        DEFAULT_ACTION,
+        translation_speed=0.055,
+        rotation_speed_deg=1.2,
+    )
+    raw_frames = int(os.environ.get("SANA_WM_DEMO_PREWARM_STREAM_FRAMES", str(DEFAULT_NUM_FRAMES)))
+    snapped = _snap_streaming_num_frames(
+        raw_frames,
+        upper_bound=int(c2w_full.shape[0]),
+        temporal_stride=int(pipeline.config.vae.vae_stride[0]),
+        sink_size=int(getattr(pipeline.refiner_settings, "sink_size", 1) or 1),
+        block_size=int(getattr(pipeline.refiner_settings, "block_size", 3) or 3),
+    )
+    print(f"[demo] prewarming streaming pipeline with {snapped} frames (discard output)", flush=True)
+    pil_image = _coerce_image(None)
+    cropped, src_size, resized_size, crop_offset = resize_and_center_crop(pil_image)
+    intr_src = load_intrinsics(Path("asset/sana_wm/demo_0_intrinsics.npy"), snapped)
+    intrinsics_vec4 = transform_intrinsics_for_crop(intr_src, src_size, resized_size, crop_offset)
+    params = GenerationParams(
+        num_frames=snapped,
+        fps=DEFAULT_FPS,
+        cfg_scale=1.0,
+        flow_shift=8.0,
+        seed=42,
+        negative_prompt="",
+        sampling_algo="self_forcing",
+        num_cached_blocks=2,
+        sink_token=True,
+        num_frame_per_block=3,
+        denoising_step_list=[int(v) for v in DEFAULT_DENOISING_STEP_LIST.split(",")],
+    )
+    last_log = 0.0
+
+    def progress(event: dict[str, object]) -> None:
+        nonlocal last_log
+        now = time.perf_counter()
+        phase = str(event.get("phase", ""))
+        if phase in {"stage1_running", "decode"} and now - last_log < 5.0:
+            return
+        last_log = now
+        print(f"[demo] warmup: {event.get('message', phase)}", flush=True)
+
+    t0 = time.perf_counter()
+    pipeline.generate_streaming(
+        cropped,
+        prompt,
+        c2w_full[:snapped],
+        intrinsics_vec4,
+        params,
+        output_path=Path(os.environ.get("SANA_WM_DEMO_PREWARM_OUTPUT", "/tmp/sana_wm_demo_warmup.mp4")),
+        streaming_crf=18,
+        streaming_preset="p4",
+        streaming_encoder="h264_nvenc",
+        output_mode="discard",
+        profile_cuda=False,
+        progress_callback=progress,
+    )
+    if _env_enabled("SANA_WM_STREAMING_LAZY_VAE_DECODER", "1"):
+        pipeline._move_vae_decoder_for_streaming("cpu")
+    if torch.cuda.is_available():
+        torch.cuda.synchronize(pipeline.device)
+    torch.cuda.empty_cache()
+    print(f"[demo] streaming warmup complete in {time.perf_counter() - t0:.1f}s", flush=True)
+
+
 def _preload_pipeline(state: DemoState) -> None:
     t0 = time.perf_counter()
     print("[demo] preloading Sana-WM pipeline before Gradio launch", flush=True)
     pipeline = state.get_pipeline()
     prompt = _default_prompt()
-    if prompt and os.environ.get("SANA_WM_DEMO_PREWARM_PROMPT", "1").lower() not in {"0", "false", "no", "off"}:
+    if prompt and _env_enabled("SANA_WM_DEMO_PREWARM_PROMPT", "1"):
         print("[demo] pre-encoding default stage-1/refiner prompts", flush=True)
         with torch.inference_mode():
             pipeline._get_streaming_refiner_prompt(prompt)
@@ -294,11 +403,51 @@ def _preload_pipeline(state: DemoState) -> None:
             pipeline.refiner.prepare_transformer_nvfp4()
         pipeline.model.to(pipeline.device)
         pipeline._prepare_stage1_nvfp4()
-        if os.environ.get("SANA_WM_STREAMING_LAZY_VAE_DECODER", "1").lower() in {"1", "true", "yes", "on"}:
+        if _env_enabled("SANA_WM_STREAMING_LAZY_VAE_DECODER", "1"):
             pipeline._move_vae_decoder_for_streaming("cpu")
         else:
             pipeline._move_vae_decoder_for_streaming(pipeline.device)
         torch.cuda.empty_cache()
+    if _env_enabled("SANA_WM_DEMO_PREWARM_VAE_STREAM", "1"):
+        print("[demo] prewarming streaming VAE decoder", flush=True)
+        with torch.inference_mode():
+            pipeline._move_vae_decoder_for_streaming(pipeline.device)
+            decoder = CausalVaeStreamingDecoder(pipeline.vae)
+            decoder.reset()
+            latent_channels = int(getattr(pipeline.vae.config, "latent_channels", pipeline.vae.latents_mean.numel()))
+            latent_h = TARGET_HEIGHT // int(pipeline.config.vae.vae_stride[-1])
+            latent_w = TARGET_WIDTH // int(pipeline.config.vae.vae_stride[-1])
+            block_size = int(getattr(pipeline.refiner_settings, "block_size", 3) or 3)
+            dtype = pipeline.weight_dtype
+            sink = torch.zeros(
+                1,
+                latent_channels,
+                1,
+                latent_h,
+                latent_w,
+                device=pipeline.device,
+                dtype=dtype,
+            )
+            block = torch.zeros(
+                1,
+                latent_channels,
+                block_size,
+                latent_h,
+                latent_w,
+                device=pipeline.device,
+                dtype=dtype,
+            )
+            decoder.decode_chunk(sink)
+            decoder.decode_chunk(block)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(pipeline.device)
+            decoder.reset()
+            del sink, block, decoder
+            if _env_enabled("SANA_WM_STREAMING_LAZY_VAE_DECODER", "1"):
+                pipeline._move_vae_decoder_for_streaming("cpu")
+            torch.cuda.empty_cache()
+    if prompt:
+        _warmup_streaming_pipeline(pipeline, prompt)
     print(f"[demo] pipeline preload complete in {time.perf_counter() - t0:.1f}s", flush=True)
 
 
@@ -317,7 +466,7 @@ def build_demo(args: argparse.Namespace, state: DemoState) -> gr.Blocks:
         encoder_choice: str,
         intrinsics_file,
     ):
-        updates: queue.Queue[tuple[str, object]] = queue.Queue(maxsize=64)
+        updates: queue.Queue[tuple[str, object]] = queue.Queue(maxsize=256)
         started = time.perf_counter()
         selected_encoder = "h264_nvenc" if encoder_choice == "h264_nvenc" else "libx264"
         output_mode = "mp4" if save_mp4 else "cpu"
@@ -332,6 +481,9 @@ def build_demo(args: argparse.Namespace, state: DemoState) -> gr.Blocks:
             updates.put(("status", "MP4 saving is off; streaming decoded chunks directly to the preview."))
 
         def put_update(kind: str, value: object) -> None:
+            if kind == "chunk":
+                updates.put((kind, value))
+                return
             try:
                 updates.put_nowait((kind, value))
             except queue.Full:
@@ -345,10 +497,11 @@ def build_demo(args: argparse.Namespace, state: DemoState) -> gr.Blocks:
             if pixel_np.shape[0] <= 0:
                 return
             put_update(
-                "frame",
+                "chunk",
                 (
-                    pixel_np[-1].copy(),
-                    f"chunk {chunk_idx:02d}  frames {frame_base}-{frame_base + pixel_np.shape[0] - 1}",
+                    pixel_np.copy(),
+                    int(frame_base),
+                    int(chunk_idx),
                 ),
             )
 
@@ -368,14 +521,20 @@ def build_demo(args: argparse.Namespace, state: DemoState) -> gr.Blocks:
                     rotation_speed_deg=float(rotation_speed_deg),
                 )
                 requested = min(int(num_frames), int(c2w_full.shape[0]))
-                snapped = _snap_num_frames(requested, stride=8, upper_bound=int(c2w_full.shape[0]))
+                snapped = _snap_streaming_num_frames(
+                    requested,
+                    upper_bound=int(c2w_full.shape[0]),
+                    temporal_stride=int(pipeline.config.vae.vae_stride[0]),
+                    sink_size=int(getattr(pipeline.refiner_settings, "sink_size", 1) or 1),
+                    block_size=int(getattr(pipeline.refiner_settings, "block_size", 3) or 3),
+                )
                 c2w = c2w_full[:snapped]
                 cropped, src_size, resized_size, crop_offset = resize_and_center_crop(pil_image)
                 intr_src = load_intrinsics(_intrinsics_path(intrinsics_file), snapped)
                 intrinsics_vec4 = transform_intrinsics_for_crop(intr_src, src_size, resized_size, crop_offset)
                 params = GenerationParams(
                     num_frames=snapped,
-                    fps=16,
+                    fps=DEFAULT_FPS,
                     cfg_scale=1.0,
                     flow_shift=8.0,
                     seed=int(seed),
@@ -424,6 +583,15 @@ def build_demo(args: argparse.Namespace, state: DemoState) -> gr.Blocks:
         thread.start()
         latest = None
         video = None
+        fps = float(DEFAULT_FPS)
+        frame_interval = 1.0 / fps
+        frame_buffer: deque[np.ndarray] = deque()
+        chunks_received = 0
+        playback_started = False
+        next_frame_time: float | None = None
+        played_frames = 0
+        generation_done = False
+        last_yield = time.perf_counter()
         progress_state: dict[str, object] = {
             "message": "queued",
             "decode_done": 0,
@@ -437,59 +605,80 @@ def build_demo(args: argparse.Namespace, state: DemoState) -> gr.Blocks:
         )
         status = "starting"
         yield latest, video, progress, status
-        while thread.is_alive() or not updates.empty():
+        while thread.is_alive() or not updates.empty() or frame_buffer:
+            now = time.perf_counter()
+            if playback_started and frame_buffer and next_frame_time is not None:
+                timeout = max(0.0, min(0.05, next_frame_time - now))
+            else:
+                timeout = 0.05
+            got_update = False
             try:
-                kind, value = updates.get(timeout=0.5)
+                kind, value = updates.get(timeout=timeout)
+                got_update = True
             except queue.Empty:
-                progress = _progress_html(
-                    save_mp4=bool(save_mp4),
-                    encoder=selected_encoder if output_mode == "mp4" else "preview-only",
-                    message=str(progress_state.get("message", status)),
-                    frames=int(progress_state.get("frames", 0) or 0),
-                    done=int(progress_state.get("decode_done", 0) or 0),
-                    total=int(progress_state.get("decode_total", 0) or 0),
-                    elapsed=time.perf_counter() - started,
-                )
-                yield latest, video, progress, status
-                continue
-            if kind == "status":
-                status = str(value)
-                progress_state["message"] = status
-            elif kind == "frame":
-                frame, detail = value
-                latest = _make_preview(frame)
-                status = f"{detail}  elapsed {time.perf_counter() - started:.1f}s"
-            elif kind == "progress":
-                progress_state.update(value)
-                status = str(progress_state.get("message", status))
-            elif kind == "done":
-                result = value
-                video = result["path"]
-                progress_state.update(
-                    {
-                        "message": "complete",
-                        "decode_done": progress_state.get("decode_total", 0),
-                        "frames": result["frames"],
-                    }
-                )
-                status = (
-                    f"done: {result['frames']} frames, wall {result['wall']:.2f}s, "
-                    f"{result['rt']:.3f}x realtime, encoder={result['encoder']}"
-                )
-                progress = _progress_html(
-                    save_mp4=bool(save_mp4),
-                    encoder=str(result["encoder"]),
-                    message="complete",
-                    frames=int(result["frames"]),
-                    done=int(progress_state.get("decode_done", 0) or 0),
-                    total=int(progress_state.get("decode_total", 0) or 0),
-                    elapsed=float(result["elapsed"]),
-                    complete=True,
-                    path=result["path"],
-                )
-            elif kind == "error":
-                status = str(value)
-                progress_state["message"] = "error"
+                kind = None
+                value = None
+            if got_update:
+                if kind == "status":
+                    status = str(value)
+                    progress_state["message"] = status
+                elif kind == "chunk":
+                    chunk_np, frame_base, chunk_idx = value
+                    chunks_received += 1
+                    for frame in chunk_np:
+                        frame_buffer.append(frame)
+                    progress_state["frames"] = max(
+                        int(progress_state.get("frames", 0) or 0),
+                        int(frame_base) + int(chunk_np.shape[0]),
+                    )
+                    if chunks_received < 2 and not playback_started:
+                        status = (
+                            f"buffering chunk {chunks_received}/2 "
+                            f"({len(frame_buffer)} frames) before realtime playback"
+                        )
+                    elif not playback_started:
+                        playback_started = True
+                        next_frame_time = time.perf_counter()
+                        status = f"realtime playback started from chunk {chunk_idx:02d}"
+                    else:
+                        status = f"received chunk {chunk_idx:02d}; buffered {len(frame_buffer)} frames"
+                elif kind == "progress":
+                    progress_state.update(value)
+                    if not playback_started:
+                        status = str(progress_state.get("message", status))
+                elif kind == "done":
+                    result = value
+                    generation_done = True
+                    video = result["path"]
+                    if frame_buffer and not playback_started:
+                        playback_started = True
+                        next_frame_time = time.perf_counter()
+                    progress_state.update(
+                        {
+                            "message": "complete",
+                            "decode_done": progress_state.get("decode_total", 0),
+                            "frames": result["frames"],
+                        }
+                    )
+                    progress = _progress_html(
+                        save_mp4=bool(save_mp4),
+                        encoder=str(result["encoder"]),
+                        message="complete",
+                        frames=int(result["frames"]),
+                        done=int(progress_state.get("decode_done", 0) or 0),
+                        total=int(progress_state.get("decode_total", 0) or 0),
+                        elapsed=float(result["elapsed"]),
+                        complete=True,
+                        path=result["path"],
+                    )
+                    status = (
+                        f"generation done: {result['frames']} frames, wall {result['wall']:.2f}s, "
+                        f"{result['rt']:.3f}x realtime; playing remaining buffer"
+                    )
+                elif kind == "error":
+                    status = str(value)
+                    progress_state["message"] = "error"
+
             if kind != "done":
                 progress = _progress_html(
                     save_mp4=bool(save_mp4),
@@ -500,7 +689,24 @@ def build_demo(args: argparse.Namespace, state: DemoState) -> gr.Blocks:
                     total=int(progress_state.get("decode_total", 0) or 0),
                     elapsed=time.perf_counter() - started,
                 )
-            yield latest, video, progress, status
+
+            now = time.perf_counter()
+            if playback_started and frame_buffer and (next_frame_time is None or now >= next_frame_time):
+                latest = _make_preview(frame_buffer.popleft())
+                played_frames += 1
+                if next_frame_time is None or now - next_frame_time > 1.0:
+                    next_frame_time = now + frame_interval
+                else:
+                    next_frame_time += frame_interval
+                if generation_done and not frame_buffer:
+                    status = f"playback complete: {played_frames} frames displayed"
+                else:
+                    status = f"live playback {played_frames} frames; buffered {len(frame_buffer)} frames"
+                last_yield = now
+                yield latest, video, progress, status
+            elif got_update or now - last_yield >= 0.5:
+                last_yield = now
+                yield latest, video, progress, status
 
     css = """
     .gradio-container { max-width: 1180px !important; }
@@ -521,7 +727,7 @@ def build_demo(args: argparse.Namespace, state: DemoState) -> gr.Blocks:
                 action = gr.Textbox(value=DEFAULT_ACTION, label="Action")
                 intrinsics = gr.File(label="Intrinsics .npy", file_types=[".npy"])
                 with gr.Row():
-                    num_frames = gr.Slider(161, 961, value=961, step=8, label="Frames")
+                    num_frames = gr.Slider(49, DEFAULT_NUM_FRAMES, value=DEFAULT_NUM_FRAMES, step=24, label="Frames")
                     seed = gr.Number(value=42, precision=0, label="Seed")
                 with gr.Row():
                     translation = gr.Number(value=0.055, label="Translation")
