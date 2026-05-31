@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import html
+import mimetypes
 import os
 import queue
 import shlex
@@ -13,6 +14,7 @@ import sys
 import threading
 import time
 import traceback
+import urllib.parse
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -91,6 +93,11 @@ TARGET_WIDTH = 1280
 DEFAULT_ACTION = "w-240,jw-120,w-240,lw-120,w-240"
 DEFAULT_FPS = 16
 DEFAULT_NUM_FRAMES = 961
+STATIC_DIR = REPO_ROOT / "app" / "static"
+HLS_JS_PATH = STATIC_DIR / "hls.min.js"
+
+mimetypes.add_type("video/mp2t", ".ts")
+mimetypes.add_type("application/vnd.apple.mpegurl", ".m3u8")
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -305,6 +312,105 @@ def _progress_html(
       <div class="mp4-progress-bar"><div style="width:{pct:.2f}%"></div></div>
       <div class="mp4-progress-meta">{safe_message} | chunks {done}/{total or '?'} | frames {int(frames)} | {elapsed:.1f}s | {safe_encoder}</div>
       {path_line}
+    </div>
+    """
+
+
+def _gradio_file_url(path: Path) -> str:
+    return "/gradio_api/file=" + urllib.parse.quote(str(path.expanduser().resolve()), safe="/:")
+
+
+def _live_preview_placeholder() -> str:
+    return """
+    <div class="live-preview-shell">
+      <div class="live-preview-empty"></div>
+    </div>
+    """
+
+
+def _live_preview_iframe(playlist_path: Path) -> str:
+    hls_js_url = _gradio_file_url(HLS_JS_PATH)
+    playlist_url = _gradio_file_url(playlist_path) + f"?v={time.time_ns()}"
+    frame = f"""
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    html, body {{
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      background: #050505;
+      overflow: hidden;
+    }}
+    video {{
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      background: #050505;
+    }}
+    #status {{
+      position: absolute;
+      left: 12px;
+      bottom: 10px;
+      padding: 4px 7px;
+      color: #d7d7d7;
+      background: rgba(0, 0, 0, 0.55);
+      font: 12px system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+      border-radius: 4px;
+    }}
+  </style>
+  <script src="{html.escape(hls_js_url, quote=True)}"></script>
+</head>
+<body>
+  <video id="video" autoplay muted playsinline controls></video>
+  <div id="status">loading</div>
+  <script>
+    const video = document.getElementById("video");
+    const statusEl = document.getElementById("status");
+    const source = "{html.escape(playlist_url, quote=True)}";
+    const setStatus = (text) => {{ statusEl.textContent = text; }};
+
+    video.muted = true;
+    video.defaultMuted = true;
+    video.playsInline = true;
+
+    if (video.canPlayType("application/vnd.apple.mpegurl")) {{
+      video.src = source;
+      video.play().then(() => setStatus("playing")).catch((err) => setStatus(err.message || String(err)));
+    }} else if (window.Hls && Hls.isSupported()) {{
+      const hls = new Hls({{
+        lowLatencyMode: true,
+        liveSyncDurationCount: 1,
+        backBufferLength: 4,
+        maxBufferLength: 8,
+        manifestLoadingTimeOut: 5000,
+        fragLoadingTimeOut: 20000,
+      }});
+      hls.on(Hls.Events.ERROR, (_event, data) => {{
+        setStatus(data.details || data.type || "hls error");
+      }});
+      hls.on(Hls.Events.MANIFEST_PARSED, () => {{
+        video.play().then(() => setStatus("playing")).catch((err) => setStatus(err.message || String(err)));
+      }});
+      hls.on(Hls.Events.FRAG_BUFFERED, () => setStatus("playing"));
+      hls.loadSource(source);
+      hls.attachMedia(video);
+    }} else {{
+      setStatus("HLS unavailable");
+    }}
+  </script>
+</body>
+</html>
+"""
+    return f"""
+    <div class="live-preview-shell">
+      <iframe
+        class="live-preview-iframe"
+        srcdoc="{html.escape(frame, quote=True)}"
+        allow="autoplay; fullscreen"
+      ></iframe>
     </div>
     """
 
@@ -845,11 +951,11 @@ def build_demo(args: argparse.Namespace, state: DemoState) -> gr.Blocks:
         encoder_thread.start()
         thread = threading.Thread(target=worker, daemon=True)
         thread.start()
-        preview = None
+        preview_html = _live_preview_placeholder()
         video = None
         chunks_received = 0
         final_video_pending = False
-        live_stream_end_pending = False
+        live_preview_started = False
         last_yield = time.perf_counter()
         progress_state: dict[str, object] = {
             "message": "queued",
@@ -863,7 +969,7 @@ def build_demo(args: argparse.Namespace, state: DemoState) -> gr.Blocks:
             message="queued",
         )
         status = "starting"
-        yield gr.skip(), gr.skip(), progress, status
+        yield preview_html, gr.skip(), progress, status
         while thread.is_alive() or encoder_thread.is_alive() or not updates.empty():
             timeout = 0.1
             got_update = False
@@ -879,7 +985,6 @@ def build_demo(args: argparse.Namespace, state: DemoState) -> gr.Blocks:
                     progress_state["message"] = status
                 elif kind == "chunk":
                     segment = dict(value)
-                    preview = str(segment["path"])
                     frame_base = int(segment["frame_base"])
                     chunk_idx = int(segment["chunk_idx"])
                     n_frames = int(segment["frames"])
@@ -896,7 +1001,6 @@ def build_demo(args: argparse.Namespace, state: DemoState) -> gr.Blocks:
                     result = value
                     video = result["path"]
                     final_video_pending = bool(video)
-                    live_stream_end_pending = True
                     progress_state.update(
                         {
                             "message": "complete",
@@ -922,7 +1026,6 @@ def build_demo(args: argparse.Namespace, state: DemoState) -> gr.Blocks:
                 elif kind == "error":
                     status = str(value)
                     progress_state["message"] = "error"
-                    live_stream_end_pending = True
 
             if kind != "done":
                 progress = _progress_html(
@@ -938,11 +1041,10 @@ def build_demo(args: argparse.Namespace, state: DemoState) -> gr.Blocks:
             now = time.perf_counter()
             if got_update or now - last_yield >= 0.5:
                 last_yield = now
-                if kind == "chunk":
-                    live_video = preview
-                elif live_stream_end_pending:
-                    live_video = None
-                    live_stream_end_pending = False
+                if kind == "chunk" and not live_preview_started:
+                    preview_html = _live_preview_iframe(segment_dir / "index.m3u8")
+                    live_video = preview_html
+                    live_preview_started = True
                 else:
                     live_video = gr.skip()
                 final_video = video if final_video_pending else gr.skip()
@@ -951,7 +1053,26 @@ def build_demo(args: argparse.Namespace, state: DemoState) -> gr.Blocks:
 
     css = """
     .gradio-container { max-width: 1180px !important; }
-    #preview video { object-fit: contain; background: #050505; }
+    .live-preview-shell {
+      width: 100%;
+      aspect-ratio: 1280 / 704;
+      background: #050505;
+      border: 1px solid #242424;
+      border-radius: 6px;
+      overflow: hidden;
+    }
+    .live-preview-empty {
+      width: 100%;
+      height: 100%;
+      background: #050505;
+    }
+    .live-preview-iframe {
+      display: block;
+      width: 100%;
+      height: 100%;
+      border: 0;
+      background: #050505;
+    }
     .mp4-progress { border: 1px solid #333; border-radius: 6px; padding: 10px 12px; background: #161616; }
     .mp4-progress-top { display: flex; justify-content: space-between; font-weight: 600; margin-bottom: 8px; }
     .mp4-progress-bar { height: 10px; background: #2a2a2a; border-radius: 999px; overflow: hidden; }
@@ -977,14 +1098,9 @@ def build_demo(args: argparse.Namespace, state: DemoState) -> gr.Blocks:
                 save_mp4 = gr.Checkbox(value=True, label="Save final MP4")
                 run = gr.Button("Generate", variant="primary")
             with gr.Column(scale=2):
-                preview = gr.Video(
+                preview = gr.HTML(
+                    _live_preview_placeholder(),
                     label="Live preview",
-                    elem_id="preview",
-                    autoplay=True,
-                    include_audio=False,
-                    interactive=False,
-                    loop=False,
-                    streaming=True,
                 )
                 video = gr.Video(label="Final MP4")
                 mp4_progress = gr.HTML(
@@ -1025,6 +1141,10 @@ def main() -> None:
         server_port=args.server_port,
         share=args.share,
         debug=False,
+        allowed_paths=[
+            str(args.output_dir.expanduser().resolve()),
+            str(STATIC_DIR.expanduser().resolve()),
+        ],
     )
 
 
