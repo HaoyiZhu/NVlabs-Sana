@@ -493,10 +493,31 @@ def action_string_to_c2w(
 # ============================================================================
 
 
+def _fit_intrinsics_sequence(arr: np.ndarray, num_frames: int) -> np.ndarray:
+    """Return ``arr`` fitted to ``num_frames`` along axis 0."""
+    arr = np.asarray(arr, dtype=np.float32)
+    if arr.shape[0] == num_frames:
+        return arr.copy()
+    if arr.shape[0] > num_frames:
+        return arr[:num_frames].copy()
+    if arr.shape[0] == 1:
+        return np.broadcast_to(arr[:1], (num_frames, *arr.shape[1:])).copy()
+
+    old_t = np.linspace(0.0, 1.0, arr.shape[0], dtype=np.float32)
+    new_t = np.linspace(0.0, 1.0, num_frames, dtype=np.float32)
+    flat = arr.reshape(arr.shape[0], -1)
+    fitted = np.empty((num_frames, flat.shape[1]), dtype=np.float32)
+    for idx in range(flat.shape[1]):
+        fitted[:, idx] = np.interp(new_t, old_t, flat[:, idx]).astype(np.float32)
+    return fitted.reshape((num_frames, *arr.shape[1:]))
+
+
 def load_intrinsics(path: Path, num_frames: int) -> np.ndarray:
     """Return ``(num_frames, 4)`` intrinsics as ``[fx, fy, cx, cy]``.
 
-    Accepts ``.npy`` arrays shaped ``(3, 3)``, ``(F, 3, 3)``, or ``(4,)``.
+    Accepts ``.npy`` arrays shaped ``(3, 3)``, ``(F, 3, 3)``, ``(4,)``, or
+    ``(F, 4)``. Per-frame intrinsics are truncated or resampled in time to
+    match ``num_frames``.
     """
     arr = np.load(path).astype(np.float32)
     if arr.shape == (4,):
@@ -504,11 +525,14 @@ def load_intrinsics(path: Path, num_frames: int) -> np.ndarray:
     if arr.shape == (3, 3):
         v = np.array([arr[0, 0], arr[1, 1], arr[0, 2], arr[1, 2]], dtype=np.float32)
         return np.broadcast_to(v, (num_frames, 4)).copy()
-    if arr.ndim == 3 and arr.shape[1:] == (3, 3) and arr.shape[0] >= num_frames:
-        K = arr[:num_frames]
+    if arr.ndim == 2 and arr.shape[1] == 4:
+        return _fit_intrinsics_sequence(arr, num_frames)
+    if arr.ndim == 3 and arr.shape[1:] == (3, 3):
+        K = _fit_intrinsics_sequence(arr, num_frames)
         return np.stack([K[:, 0, 0], K[:, 1, 1], K[:, 0, 2], K[:, 1, 2]], axis=1)
     raise ValueError(
-        f"Unsupported intrinsics shape {arr.shape} for num_frames={num_frames}; " f"expected (3,3), (F,3,3), or (4,)."
+        f"Unsupported intrinsics shape {arr.shape} for num_frames={num_frames}; "
+        f"expected (3,3), (F,3,3), (4,), or (F,4)."
     )
 
 
