@@ -56,8 +56,8 @@ scheduler).  Slot 6 distinguishes GDN (state-based) from softmax
      - tconv state (handled by CachedGLUMBConvTemp)
      - tconv state
    * - 6
-     - type flag: tensor([1.0])
-     - type flag: tensor([0.0])
+     - type flag: 1.0
+     - type flag: 0.0
    * - 7-9
      - reserved
      - reserved
@@ -723,7 +723,7 @@ def _cached_gdn_forward_triton(
     if save_kv_cache:
         kv_cache[_SLOT_FWD_KV] = S_kv_new.detach().clone()
         kv_cache[_SLOT_FWD_Z] = S_z_new.detach().clone()
-        kv_cache[_SLOT_TYPE_FLAG] = torch.tensor([_TYPE_STATE], device=x.device)
+        kv_cache[_SLOT_TYPE_FLAG] = _TYPE_STATE
 
     # 5. Output gate + projection, matching the torch path's tail.
     out = out_4d.reshape(B, N, C)

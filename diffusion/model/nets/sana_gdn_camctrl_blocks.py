@@ -52,6 +52,7 @@ from .sana_gdn_blocks import (
     BidirectionalGDN,
     ChunkCausalGDN,
     _forward_softmax_attn,
+    _sdpa_needs_head_pad,
     flip_and_shift,
 )
 
@@ -156,7 +157,7 @@ def _sdpa_unmasked_with_pad(
         ``(B, H, N_q, D)`` attention output.
     """
     D = q.shape[-1]
-    _need_pad = D not in (32, 64, 128, 256) and D < 256
+    _need_pad = _sdpa_needs_head_pad(D)
     if _need_pad:
         _pad_to = 128 if D <= 128 else 256
         _pad_size = _pad_to - D

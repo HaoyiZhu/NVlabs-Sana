@@ -10,39 +10,36 @@
 
 """End-to-end streaming SANA-WM inference.
 
-Four-stream chunk-pipelined recipe:
+Three-stream chunk-pipelined recipe:
 
-    * **Stage-1 denoise** — chunk-causal distilled student
-      (``SanaMSVideoCamCtrlStreaming``) with self-forcing AR sampling
-      (4 steps, ``cfg_scale=1``).
-    * **Stage-1 KV save** — runs on its own CUDA stream so it overlaps with
-      the refiner + decode of the just-finished chunk instead of sitting on
-      stage-1's critical path (bit-exact vs. the legacy single-stream path;
-      see ``tests/sana_wm/test_split_kv_save_equiv.py``).
+    * **Stage 1** — chunk-causal distilled student (``SanaMSVideoCamCtrlStreaming``)
+      with self-forcing AR sampling (4 steps, ``cfg_scale=1``).
     * **Refiner** — chunk-causal LTX-2 with a sliding KV window (canonical
       3-step distilled schedule).
     * **VAE** — causal LTX-2 VAE that decodes one block at a time.
 
-One decoded chunk per AR block is appended to a progressive MP4 you can
-watch while generation continues.
+Stages run on dedicated CUDA streams; one decoded chunk per AR block is
+appended to a progressive MP4 you can watch while generation continues.
 
 The script applies the canonical fast configuration by default — no flags
 needed:
 
     * ``torch.compile`` on the VAE decoder + refiner transformer
       (``max-autotune-no-cudagraphs``, numerically equivalent to eager).
-    * Flash-only SDPA, Inductor ``coordinate_descent_tuning`` + ``epilogue_fusion``,
-      cuDNN benchmark, expandable CUDA allocator.
+    * Fast SDPA backend selection, Inductor ``coordinate_descent_tuning`` +
+      ``epilogue_fusion``, cuDNN benchmark, expandable CUDA allocator.
 
-Reaches ~0.95× of realtime in steady-state on a single H100 after the
+Reaches ~0.93× of realtime in steady-state on a single H100 after the
 one-time ``torch.compile`` warmup (~3 min cold, ~30 s warm cache).
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
+import time
 from pathlib import Path
 
 # Env knobs that must be set before any ``torch`` / ``diffusion.*`` import.
@@ -98,9 +95,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "--action", type=str, help="Action DSL string, e.g. 'w-120,lw-80,...'. Rolled out internally."
     )
 
-    p.add_argument("--translation_speed", type=float, default=0.04,
+    p.add_argument("--translation_speed", type=float, default=0.025,
                    help="Per-frame translation magnitude when --action is used.")
-    p.add_argument("--rotation_speed_deg", type=float, default=1.2,
+    p.add_argument("--rotation_speed_deg", type=float, default=0.6,
                    help="Per-frame rotation magnitude (degrees) when --action is used.")
     p.add_argument("--intrinsics", type=Path, default=None,
                    help="(3,3), (F,3,3), or (4,) intrinsics .npy. Pi3X-estimated if omitted.")
@@ -131,7 +128,7 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Latent frames per stage-1 AR chunk (must match the model's chunk_size).")
     p.add_argument("--refiner_block_size", type=int, default=3,
                    help="Refiner latent frames per AR block.")
-    p.add_argument("--refiner_kv_max_frames", type=int, default=10,
+    p.add_argument("--refiner_kv_max_frames", type=int, default=11,
                    help="Refiner KV sliding-window size (sink + history + active).")
     p.add_argument("--refiner_seed", type=int, default=42)
     p.add_argument("--sink_size", type=int, default=1)
@@ -143,11 +140,31 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="ffmpeg CRF for the progressive MP4 (lower = higher quality).")
     p.add_argument("--streaming_preset", default="medium",
                    help="ffmpeg libx264 preset for the progressive MP4 writer.")
+    p.add_argument("--streaming_encoder", default=os.environ.get("SANA_WM_STREAMING_MP4_ENCODER", "libx264"),
+                   help="MP4 encoder: libx264 or h264_nvenc.")
+    p.add_argument("--output_mode", choices=["mp4", "cpu", "discard"], default="mp4",
+                   help="mp4 writes H.264, cpu copies decoded uint8 frames to host without writing, discard decodes on GPU and drops frames after synchronization.")
+    p.add_argument("--no_mp4", action="store_true",
+                   help="Alias for --output_mode=discard; excludes uint8 CPU transfer and MP4 encoding from timings.")
+    p.add_argument("--benchmark_json", type=Path, default=None,
+                   help="Optional JSON file with wall-clock throughput metrics.")
+    p.add_argument("--benchmark_repeats", type=int, default=1,
+                   help="Run generation this many times in one process; useful for warm/steady benchmark separation.")
+    p.add_argument("--profile_cuda", action="store_true",
+                   help="Record per-stage CUDA event timings; useful for bottleneck breakdown but disabled by default for pure throughput.")
+    p.add_argument("--sample_frames_npz", type=Path, default=None,
+                   help="Optional .npz path for sampled decoded uint8 frames.")
+    p.add_argument("--sample_frame_stride", type=int, default=16,
+                   help="Save every Nth output frame when --sample_frames_npz is set.")
+    p.add_argument("--no_compile", action="store_true",
+                   help="Disable torch.compile for smoke/debug runs.")
 
     p.add_argument("--offload_vae", action="store_true",
                    help="Move the VAE to CPU between encode/decode steps.")
     p.add_argument("--offload_refiner", action="store_true",
                    help="Lazy-load the LTX-2 refiner only when needed; release afterwards.")
+    p.add_argument("--offload_text_encoder", action="store_true",
+                   help="Move the stage-1 text encoder to CPU after prompt encoding to save GPU memory.")
     return p
 
 
@@ -172,11 +189,14 @@ def _resolve_streaming_paths(args: argparse.Namespace) -> tuple[Path, Path, Path
 
 
 def _apply_fast_defaults() -> None:
-    """Set the numerically-neutral perf knobs (cuDNN bench, flash SDPA, Inductor)."""
+    """Set numerically-neutral perf knobs (cuDNN bench, SDPA, Inductor)."""
     torch.backends.cudnn.benchmark = True
     torch.set_float32_matmul_precision("high")
     torch.backends.cuda.enable_flash_sdp(True)
-    torch.backends.cuda.enable_math_sdp(False)
+    # Keep math SDP as a fallback for the Gemma text encoder shapes that are
+    # not accepted by flash/cuDNN SDP on GB200. Main video attention still
+    # selects flash/cuDNN where legal.
+    torch.backends.cuda.enable_math_sdp(True)
     torch.backends.cuda.enable_mem_efficient_sdp(False)
     torch.backends.cuda.enable_cudnn_sdp(True)
     import torch._inductor.config as _ic
@@ -186,6 +206,8 @@ def _apply_fast_defaults() -> None:
 
 def main() -> None:
     args = _build_parser().parse_args()
+    if args.benchmark_repeats < 1:
+        raise SystemExit("--benchmark_repeats must be >= 1.")
     logger: logging.Logger = get_root_logger()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _apply_fast_defaults()
@@ -239,22 +261,48 @@ def main() -> None:
         refiner=refiner,
         offload_vae=args.offload_vae,
         offload_refiner=args.offload_refiner,
+        offload_text_encoder=args.offload_text_encoder,
         logger=logger,
     )
 
-    # Numerically-equivalent compile (default Inductor mode, no CUDA-graph
-    # capture, no fp32->fp16 substitution). Cold compile takes ~3 min the
-    # first time; subsequent runs reuse the Inductor cache.
-    logger.info(
-        "[streaming] torch.compile(vae.decoder + refiner.transformer, "
-        "mode='max-autotune-no-cudagraphs')"
-    )
-    pipeline.vae.decoder = torch.compile(
-        pipeline.vae.decoder, mode="max-autotune-no-cudagraphs", dynamic=True
-    )
-    pipeline.refiner.transformer = torch.compile(
-        pipeline.refiner.transformer, mode="max-autotune-no-cudagraphs", dynamic=True
-    )
+    if not args.no_compile:
+        # Numerically-equivalent compile (default Inductor mode, no CUDA-graph
+        # capture, no fp32->fp16 substitution). Cold compile takes ~3 min the
+        # first time; subsequent runs reuse the Inductor cache.
+        compile_mode = os.environ.get("SANA_WM_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs").strip()
+        compile_dynamic_raw = os.environ.get("SANA_WM_TORCH_COMPILE_DYNAMIC", "1").strip().lower()
+        compile_dynamic = compile_dynamic_raw not in {"0", "false", "no", "off"}
+        compile_targets_raw = os.environ.get("SANA_WM_TORCH_COMPILE_TARGETS", "refiner")
+        compile_targets = {
+            item.strip().lower()
+            for item in compile_targets_raw.replace("+", ",").split(",")
+            if item.strip()
+        }
+        unsupported_targets = compile_targets - {"vae", "refiner"}
+        if unsupported_targets:
+            raise SystemExit(
+                "SANA_WM_TORCH_COMPILE_TARGETS only supports 'vae' and 'refiner'; "
+                f"got {sorted(unsupported_targets)}."
+            )
+        # The causal VAE streaming decoder must NOT be torch.compile'd: the
+        # compiled graph corrupts its cross-chunk causal cache, so chunk 0
+        # decodes correctly but every chunk >=1 decodes to zeros (uniform gray
+        # frames from ~1.5s on). Refuse it unconditionally; compile the refiner
+        # (the heavy module) instead.
+        if "vae" in compile_targets:
+            logger.warning(
+                "[streaming] ignoring 'vae' in SANA_WM_TORCH_COMPILE_TARGETS: compiling the "
+                "causal VAE decoder corrupts its streaming cache (chunk>=1 -> blank). Skipping it."
+            )
+            compile_targets.discard("vae")
+        logger.info(
+            "[streaming] torch.compile("
+            f"targets={sorted(compile_targets)}, mode={compile_mode!r}, dynamic={compile_dynamic})"
+        )
+        if "refiner" in compile_targets:
+            pipeline.refiner.transformer = torch.compile(
+                pipeline.refiner.transformer, mode=compile_mode, dynamic=compile_dynamic
+            )
 
     denoising_step_list = [int(t.strip()) for t in args.denoising_step_list.split(",") if t.strip()]
     if not denoising_step_list or denoising_step_list[-1] != 0:
@@ -276,21 +324,192 @@ def main() -> None:
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    streaming_path = out_dir / f"{args.name}_streaming.mp4"
-    logger.info(f"[streaming] starting interactive chunk-pipelined inference -> {streaming_path}")
-    result = pipeline.generate_streaming(
-        cropped,
-        prompt,
-        c2w,
-        intrinsics_vec4,
-        params,
-        output_path=streaming_path,
-        streaming_crf=args.streaming_crf,
-        streaming_preset=args.streaming_preset,
-    )
-    logger.info(
-        f"[streaming] done: wrote {result['n_pixel_frames']} frames to {result['output_path']}"
-    )
+    if args.no_mp4 and args.output_mode not in {"mp4", "discard"}:
+        raise SystemExit("--no_mp4 cannot be combined with --output_mode=cpu.")
+    output_mode = "discard" if args.no_mp4 else args.output_mode
+    if args.sample_frames_npz is not None and args.sample_frame_stride < 1:
+        raise SystemExit("--sample_frame_stride must be >= 1.")
+
+    run_payloads = []
+    result = None
+    end_to_end_seconds = 0.0
+    for run_idx in range(args.benchmark_repeats):
+        suffix = "" if args.benchmark_repeats == 1 else f"_run{run_idx:02d}"
+        streaming_path = out_dir / f"{args.name}{suffix}_streaming.mp4"
+        sample_frames_path = None
+        if args.sample_frames_npz is not None:
+            sample_frames_path = args.sample_frames_npz
+            if args.benchmark_repeats > 1:
+                sample_frames_path = sample_frames_path.with_name(
+                    f"{sample_frames_path.stem}{suffix}{sample_frames_path.suffix}"
+                )
+        logger.info(
+            f"[streaming] starting interactive chunk-pipelined inference "
+            f"run={run_idx}/{args.benchmark_repeats - 1} "
+            f"output_mode={output_mode} -> {streaming_path}"
+        )
+        wall_start = time.perf_counter()
+        result = pipeline.generate_streaming(
+            cropped,
+            prompt,
+            c2w,
+            intrinsics_vec4,
+            params,
+            output_path=streaming_path,
+            streaming_crf=args.streaming_crf,
+            streaming_preset=args.streaming_preset,
+            streaming_encoder=args.streaming_encoder,
+            output_mode=output_mode,
+            profile_cuda=args.profile_cuda,
+            sample_frames_path=sample_frames_path,
+            sample_frame_stride=args.sample_frame_stride,
+        )
+        end_to_end_seconds = time.perf_counter() - wall_start
+        logger.info(
+            f"[streaming] done: run={run_idx} mode={result['output_mode']} "
+            f"frames={result['n_pixel_frames']} stream_wall={result['wall_seconds']:.3f}s "
+            f"e2e={end_to_end_seconds:.3f}s fps={result['frames_per_second']:.3f} "
+            f"realtime={result['realtime_factor']:.3f}x path={result['output_path']}"
+        )
+        run_payloads.append(
+            {
+                "run_index": int(run_idx),
+                "output_mode": result["output_mode"],
+                "output_path": str(result["output_path"]) if result["output_path"] is not None else None,
+                "n_pixel_frames": int(result["n_pixel_frames"]),
+                "frames_per_second": float(result["frames_per_second"]),
+                "realtime_factor": float(result["realtime_factor"]),
+                "stream_wall_seconds": float(result["wall_seconds"]),
+                "end_to_end_seconds": float(end_to_end_seconds),
+                "first_chunk_seconds": result["first_chunk_seconds"],
+                "first_chunk_frames": result["first_chunk_frames"],
+                "steady_state_seconds": result["steady_state_seconds"],
+                "steady_state_frames_per_second": result["steady_state_frames_per_second"],
+                "steady_state_realtime_factor": result["steady_state_realtime_factor"],
+                "stage1_cuda_seconds": result["stage1_cuda_seconds"],
+                "refiner_cuda_seconds": result["refiner_cuda_seconds"],
+                "decode_cuda_seconds": result["decode_cuda_seconds"],
+                "sample_frames_path": (
+                    str(result["sample_frames_path"]) if result["sample_frames_path"] is not None else None
+                ),
+                "sampled_frame_count": int(result["sampled_frame_count"]),
+                "sampled_frame_indices": result["sampled_frame_indices"],
+            }
+        )
+
+    assert result is not None
+    if args.benchmark_json is not None:
+        runtime_env = {
+            name: os.environ.get(name)
+            for name in (
+                "CUDA_VISIBLE_DEVICES",
+                "DPM_TQDM",
+                "FUSED_GDN_PRECISION",
+                "PRECISION_OVERRIDE",
+                "PYTORCH_CUDA_ALLOC_CONF",
+                "SANA_WM_STREAMING_PROMPT_CACHE",
+                "SANA_WM_STREAMING_MP4_ENCODER",
+                "SANA_WM_STREAMING_PREDECODE_SINK",
+                "SANA_WM_STREAMING_DIRECT_REFINED_BLOCKS",
+                "SANA_WM_STREAMING_REFINER_FIRST",
+                "SANA_WM_STREAMING_DECODE_CURRENT",
+                "SANA_WM_STAGE1_NVFP4",
+                "SANA_WM_STAGE1_NVFP4_MODE",
+                "SANA_WM_STAGE1_NVFP4_INCLUDE_PATTERNS",
+                "SANA_WM_STAGE1_NVFP4_SKIP_PATTERNS",
+                "SANA_WM_STAGE1_NVFP4_TEXT_PAD_MULTIPLE",
+                "SANA_WM_STAGE1_LINEARIZE_FFN",
+                "SANA_WM_STAGE1_KV_SAVE_STRIDE",
+                "SANA_WM_SDPA_D112_DIRECT",
+                "SANA_WM_REFINER_NVFP4",
+                "SANA_WM_REFINER_ATTN_BACKEND",
+                "SANA_WM_REFINER_SELF_ATTN_KERNEL",
+                "SANA_WM_REFINER_PRECONCAT_PREFIX",
+                "SANA_WM_REFINER_KV_CACHE_DTYPE",
+                "SANA_WM_REFINER_CAPTURE_KV_ONLY_LAST",
+                "SANA_WM_REFINER_FUSE_SELF_QKV",
+                "SANA_WM_REFINER_FAST_KV_CAPTURE",
+                "SANA_WM_REFINER_PREGENERATE_NOISE",
+                "SANA_WM_REFINER_TIMESTEP_CACHE",
+                "SANA_WM_REFINER_FAST_KV_CLEAN_INTERVAL",
+                "SANA_WM_REFINER_HISTORY_LAYERS",
+                "SANA_WM_REFINER_HISTORY_LAYER_STRIDE",
+                "SANA_WM_REFINER_HISTORY_LAYER_OFFSET",
+                "SANA_WM_REFINER_HISTORY_KEEP_LAST",
+                "SANA_WM_REFINER_CROSS_ATTN_KV_CACHE",
+                "SANA_WM_REFINER_EMPTY_CACHE_BEFORE_PREFIX",
+                "SANA_WM_REFINER_EMPTY_CACHE_BEFORE_CAPTURE",
+                "SANA_WM_REFINER_PROFILE",
+                "SANA_WM_REFINER_LAYER_PROFILE",
+                "SANA_WM_REFINER_NVFP4_OFFLOAD_STAGE1",
+                "SANA_WM_REFINER_NVFP4_OFFLOAD_VAE",
+                "SANA_WM_TE_NVFP4_CPU_STAGING",
+                "SANA_WM_STREAMING_LAZY_VAE_DECODER",
+                "SANA_WM_TORCH_COMPILE_MODE",
+                "SANA_WM_TORCH_COMPILE_DYNAMIC",
+                "SANA_WM_TORCH_COMPILE_TARGETS",
+                "SANA_WM_CUDAGRAPH_MARK_STEP",
+            )
+            if os.environ.get(name) is not None
+        }
+        payload = {
+            "output_mode": result["output_mode"],
+            "output_path": str(result["output_path"]) if result["output_path"] is not None else None,
+            "num_frames": int(num_frames),
+            "requested_num_frames": int(args.num_frames),
+            "actual_num_frames": int(num_frames),
+            "n_pixel_frames": int(result["n_pixel_frames"]),
+            "fps_target": int(args.fps),
+            "frames_per_second": float(result["frames_per_second"]),
+            "realtime_factor": float(result["realtime_factor"]),
+            "stream_wall_seconds": float(result["wall_seconds"]),
+            "end_to_end_seconds": float(end_to_end_seconds),
+            "first_chunk_seconds": result["first_chunk_seconds"],
+            "first_chunk_frames": result["first_chunk_frames"],
+            "steady_state_seconds": result["steady_state_seconds"],
+            "steady_state_frames_per_second": result["steady_state_frames_per_second"],
+            "steady_state_realtime_factor": result["steady_state_realtime_factor"],
+            "stage1_cuda_seconds": result["stage1_cuda_seconds"],
+            "refiner_cuda_seconds": result["refiner_cuda_seconds"],
+            "decode_cuda_seconds": result["decode_cuda_seconds"],
+            "sample_frames_path": str(result["sample_frames_path"]) if result["sample_frames_path"] is not None else None,
+            "sampled_frame_count": int(result["sampled_frame_count"]),
+            "sampled_frame_indices": result["sampled_frame_indices"],
+            "n_refiner_blocks": int(result["n_refiner_blocks"]),
+            "n_decode_chunks": int(result["n_decode_chunks"]),
+            "denoising_step_list": denoising_step_list,
+            "num_frame_per_block": int(args.num_frame_per_block),
+            "refiner_block_size": int(args.refiner_block_size),
+            "refiner_kv_max_frames": int(args.refiner_kv_max_frames),
+            "streaming_encoder": str(args.streaming_encoder),
+            "num_cached_blocks": int(args.num_cached_blocks),
+            "torch_compile": not bool(args.no_compile),
+            "profile_cuda": bool(args.profile_cuda),
+            "streaming_root": str(args.streaming_root),
+            "config": str(config_path),
+            "model_path": str(model_path),
+            "causal_vae_path": str(causal_vae_path),
+            "refiner_root": str(refiner_root),
+            "refiner_gemma_root": str(gemma_root),
+            "benchmark_repeats": int(args.benchmark_repeats),
+            "runtime_env": runtime_env,
+            "runs": run_payloads,
+            "best_stream_wall_seconds": min(run["stream_wall_seconds"] for run in run_payloads),
+            "best_realtime_factor": max(run["realtime_factor"] for run in run_payloads),
+            "best_steady_state_realtime_factor": max(
+                (
+                    run["steady_state_realtime_factor"]
+                    for run in run_payloads
+                    if run["steady_state_realtime_factor"] is not None
+                ),
+                default=None,
+            ),
+            "last_stream_wall_seconds": float(run_payloads[-1]["stream_wall_seconds"]),
+            "last_realtime_factor": float(run_payloads[-1]["realtime_factor"]),
+            "last_steady_state_realtime_factor": run_payloads[-1]["steady_state_realtime_factor"],
+        }
+        args.benchmark_json.parent.mkdir(parents=True, exist_ok=True)
+        args.benchmark_json.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
 if __name__ == "__main__":

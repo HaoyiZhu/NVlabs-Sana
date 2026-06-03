@@ -46,8 +46,20 @@ from diffusion.model.registry import ATTENTION_BLOCKS
 _COMPILE_DISABLE = os.environ.get("GDN_DISABLE_COMPILE", "0") not in ("0", "false")
 
 _HAS_FLEX_ATTENTION = bool(int(os.environ.get("SANA_USE_FLEX_ATTENTION", "0")))
+_SDPA_D112_DIRECT = os.environ.get("SANA_WM_SDPA_D112_DIRECT", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 OUTPUT_GATE_INIT_BIAS = 1.278464542761074  # silu(x)=1.0
+
+
+def _sdpa_needs_head_pad(head_dim: int) -> bool:
+    if head_dim == 112 and _SDPA_D112_DIRECT:
+        return False
+    return head_dim not in (32, 64, 128, 256) and head_dim < 256
 
 
 def l2norm(x: torch.FloatTensor, dim: int = -1, eps: float = 1e-6):
@@ -1003,7 +1015,7 @@ def _forward_softmax_attn_chunk_causal(
         else:
             # Fallback: per-chunk loop with head_dim padding for FlashAttention.
             D = q.shape[-1]
-            _need_pad = D not in (32, 64, 128, 256) and D < 256
+            _need_pad = _sdpa_needs_head_pad(D)
             if _need_pad:
                 _pad_to = 128 if D <= 128 else 256
                 _pad_size = _pad_to - D
@@ -1023,7 +1035,7 @@ def _forward_softmax_attn_chunk_causal(
     else:
         # Fully bidirectional softmax (no chunking).
         D = q.shape[-1]
-        _need_pad = D not in (32, 64, 128, 256) and D < 256
+        _need_pad = _sdpa_needs_head_pad(D)
         if _need_pad:
             _pad_to = 128 if D <= 128 else 256
             _pad_size = _pad_to - D
@@ -1326,7 +1338,7 @@ class CachedChunkCausalSoftmaxAttn(ChunkCausalSoftmaxAttn):
         if save_kv_cache:
             kv_cache[_SLOT_FWD_KV] = k.detach().clone()
             kv_cache[_SLOT_FWD_Z] = v.detach().clone()
-            kv_cache[_SLOT_TYPE_FLAG] = torch.tensor([_TYPE_CONCAT], device=x.device)
+            kv_cache[_SLOT_TYPE_FLAG] = _TYPE_CONCAT
         if cached_k is not None:
             k = torch.cat([cached_k.to(k.dtype), k], dim=2)
             v = torch.cat([cached_v.to(v.dtype), v], dim=2)

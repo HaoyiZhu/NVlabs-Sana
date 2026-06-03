@@ -14,12 +14,33 @@ finalized the MOOV atom so the resulting file is immediately playable.
 
 from __future__ import annotations
 
+import os
 import shlex
+import shutil
 import subprocess
 from pathlib import Path
 from typing import IO
 
 import numpy as np
+
+
+def resolve_ffmpeg_exe() -> str:
+    """Return an ffmpeg executable path, falling back to imageio-ffmpeg."""
+    env_path = os.environ.get("SANA_WM_FFMPEG_BIN", "").strip()
+    if env_path:
+        return env_path
+    system_path = shutil.which("ffmpeg")
+    if system_path:
+        return system_path
+    try:
+        import imageio_ffmpeg
+
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception as exc:
+        raise RuntimeError(
+            "ffmpeg was not found on PATH and imageio_ffmpeg is unavailable. "
+            "Install ffmpeg or set SANA_WM_FFMPEG_BIN."
+        ) from exc
 
 
 class StreamingMp4Writer:
@@ -47,6 +68,7 @@ class StreamingMp4Writer:
         fps: int = 16,
         crf: int = 18,
         preset: str = "medium",
+        encoder: str = "libx264",
         extra_args: list[str] | None = None,
         loglevel: str = "warning",
     ) -> None:
@@ -58,8 +80,35 @@ class StreamingMp4Writer:
         self._closed = False
         self._frames_written = 0
 
+        encoder = str(encoder).strip().lower()
+        if encoder in {"x264", "cpu", "libx264"}:
+            codec_args = [
+                "-c:v",
+                "libx264",
+                "-preset",
+                preset,
+                "-crf",
+                str(int(crf)),
+            ]
+        elif encoder in {"nvenc", "h264_nvenc"}:
+            # Use NVIDIA's hardware H.264 encoder. The raw RGB upload and
+            # yuv420 conversion remain part of the ffmpeg process, but entropy
+            # coding no longer competes with the Python process on CPU cores.
+            codec_args = [
+                "-c:v",
+                "h264_nvenc",
+                "-preset",
+                preset,
+                "-cq",
+                str(int(crf)),
+                "-b:v",
+                "0",
+            ]
+        else:
+            raise ValueError(f"Unsupported streaming MP4 encoder: {encoder!r}.")
+
         cmd: list[str] = [
-            "ffmpeg",
+            resolve_ffmpeg_exe(),
             "-y",
             "-loglevel",
             loglevel,
@@ -76,12 +125,7 @@ class StreamingMp4Writer:
             "-i",
             "pipe:0",
             *(extra_args or []),
-            "-c:v",
-            "libx264",
-            "-preset",
-            preset,
-            "-crf",
-            str(int(crf)),
+            *codec_args,
             "-pix_fmt",
             "yuv420p",
             "-movflags",

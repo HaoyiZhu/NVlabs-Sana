@@ -403,29 +403,21 @@ class SelfForcingFlowEulerCamCtrl(SelfForcingFlowEuler):
         generator: torch.Generator | None = None,
         *,
         denoising_step_list: list[int] | None = None,
-        yield_save_separately: bool = False,
         **kwargs: object,
     ):
         """Streaming variant of :meth:`sample` — yields one chunk at a time.
 
-        Yields ``(chunk_idx, latent_chunk_view, start_f, end_f)`` after each
-        chunk's denoise+save pass. ``latent_chunk_view`` is a view into the
-        in-place-mutated ``latents`` tensor and stays valid for the rest of
-        inference (subsequent chunks never overwrite earlier frames), so the
-        orchestrator can hand it across CUDA streams without copying.
+        After each AR chunk completes (denoising + KV-cache save pass), yields
+        a tuple ``(chunk_idx, latent_chunk_view, start_f, end_f)`` where
+        ``latent_chunk_view`` is a *view* into the in-place-mutated ``latents``
+        tensor for the just-finished chunk. The view stays valid for the
+        remainder of inference (subsequent chunks never overwrite earlier
+        frames), so the orchestrator may launch downstream work on a separate
+        CUDA stream and continue pulling chunks without copying.
 
         ``sample(latents, ...)`` is implemented as ``for _ in sample_chunks(...)``
         and returns ``latents`` after exhaustion, so the legacy whole-volume
         API is preserved.
-
-        With ``yield_save_separately=True`` (used by the streaming orchestrator
-        in :mod:`inference_video_scripts.streaming_pipeline`), the chunk is
-        yielded *before* the KV-save forward and the caller must ``next()``
-        once more to drive the save (yields ``None`` as a sentinel). This lets
-        the save run on its own CUDA stream — overlapping with the current
-        chunk's refiner+decode — so it no longer sits on stage-1's critical
-        path. The refined latents are stable across the gap because nothing
-        else writes to them until the next chunk begins.
         """
         # Resolve scheduler factory once (a fresh instance is built per chunk).
         if denoising_step_list is not None:
@@ -451,6 +443,9 @@ class SelfForcingFlowEulerCamCtrl(SelfForcingFlowEuler):
         self._chunk_indices = chunk_indices
         num_chunks = len(chunk_indices) - 1
         kv_cache = self._initialize_kv_cache(num_chunks)
+        kv_save_stride = int(os.environ.get("SANA_WM_STAGE1_KV_SAVE_STRIDE", "1"))
+        if kv_save_stride < 0:
+            raise ValueError("SANA_WM_STAGE1_KV_SAVE_STRIDE must be >= 0.")
 
         assert self.condition.shape[0] == batch_size or self.condition.shape[0] == num_chunks
         if self.condition.shape[0] == batch_size:
@@ -534,19 +529,20 @@ class SelfForcingFlowEulerCamCtrl(SelfForcingFlowEuler):
                 if start_f <= frame_idx < end_f:
                     cond_local_indices.append(frame_idx - start_f)
 
-            # Build condition mask for this chunk: 1.0 for conditioned (clean)
-            # frames, 0.0 for noisy frames. Shape (B, C, F_chunk, H, W).
-            condition_mask_chunk = torch.zeros(
-                batch_size,
-                num_latent_channels,
-                chunk_frames,
-                height,
-                width,
-                device=device,
-                dtype=torch.float32,
-            )
-            for loc in cond_local_indices:
-                condition_mask_chunk[:, :, loc] = 1.0
+            # Build a per-frame mask instead of a full (B,C,F,H,W) tensor.
+            # The model consumes frame-level timesteps and the scheduler uses
+            # the same frame value broadcast over spatial tokens.
+            condition_frame_mask = None
+            if cond_local_indices:
+                condition_frame_mask = torch.zeros(
+                    batch_size,
+                    chunk_frames,
+                    device=device,
+                    dtype=torch.float32,
+                )
+                for loc in cond_local_indices:
+                    condition_frame_mask[:, loc] = 1.0
+            spatial_tokens = height * width
 
             for i, t in tqdm(
                 list(enumerate(timesteps)),
@@ -559,23 +555,27 @@ class SelfForcingFlowEulerCamCtrl(SelfForcingFlowEuler):
                     else latents[:, :, start_f:end_f]
                 )
 
-                # Broadcast the device-side timestep instead of materialising
-                # via `.item()` — the latter would D2H-sync and serialise the
-                # host with stage-1's kernels.
-                t_dev = t.to(device=device, dtype=torch.float32).view(1, 1, 1, 1, 1)
-                timestep_tensor = (1.0 - condition_mask_chunk) * t_dev
-
-                if do_classifier_free_guidance:
-                    timestep_tensor_model = torch.cat(
-                        [timestep_tensor, timestep_tensor],
-                        dim=0,
-                    )
+                # Keep the timestep on device without `.item()` syncs, but
+                # avoid materialising a full channel x spatial mask.
+                t_dev = t.to(device=device, dtype=torch.float32).reshape(1)
+                if condition_frame_mask is None:
+                    timestep_frames = t_dev.expand(batch_size, chunk_frames)
+                    per_token_timesteps = t_dev.expand(batch_size, chunk_frames * spatial_tokens)
                 else:
-                    timestep_tensor_model = timestep_tensor
+                    timestep_frames = (1.0 - condition_frame_mask) * t_dev
+                    per_token_timesteps = timestep_frames[:, :, None].expand(
+                        batch_size,
+                        chunk_frames,
+                        spatial_tokens,
+                    ).reshape(batch_size, -1)
+
+                timestep_tensor_model = timestep_frames[:, None, :]
+                if do_classifier_free_guidance:
+                    timestep_tensor_model = torch.cat([timestep_tensor_model, timestep_tensor_model], dim=0)
 
                 noise_pred, _ = self.model(
                     latent_model_input,
-                    timestep_tensor_model[:, :1, :, 0, 0],
+                    timestep_tensor_model,
                     prompt_embeds,
                     start_f=rope_start_f,
                     end_f=rope_end_f,
@@ -612,11 +612,7 @@ class SelfForcingFlowEulerCamCtrl(SelfForcingFlowEuler):
                         num_latent_channels,
                         -1,
                     ).transpose(1, 2),
-                    per_token_timesteps=timestep_tensor.reshape(
-                        batch_size,
-                        num_latent_channels,
-                        -1,
-                    )[:, 0],
+                    per_token_timesteps=per_token_timesteps,
                     return_dict=False,
                 )[0]
                 denoised = denoised.transpose(1, 2).reshape(chunk_shape)
@@ -630,37 +626,40 @@ class SelfForcingFlowEulerCamCtrl(SelfForcingFlowEuler):
                 if latents.dtype != latents_dtype:
                     latents = latents.to(latents_dtype)
 
-            if yield_save_separately:
-                yield chunk_idx, latents[:, :, start_f:end_f], start_f, end_f
-
             # KV cache save pass — populates the chunk's clean-sigma K/V for
-            # future chunks' self-attention.
-            latent_model_input = (
-                torch.cat([latents[:, :, start_f:end_f]] * 2)
-                if do_classifier_free_guidance
-                else latents[:, :, start_f:end_f]
+            # future chunks' self-attention. A stride >1 is an experimental
+            # Stage-1-only approximation; stage 2 still refines every chunk.
+            do_kv_save = kv_save_stride == 1 or (
+                kv_save_stride > 1 and chunk_idx % kv_save_stride == 0
             )
-            timestep = torch.zeros(latent_model_input.shape[0], device=device)
+            if kv_save_stride == 0:
+                do_kv_save = bool(self.sink_token and chunk_idx == 0)
+            if do_kv_save:
+                latent_model_input = (
+                    torch.cat([latents[:, :, start_f:end_f]] * 2)
+                    if do_classifier_free_guidance
+                    else latents[:, :, start_f:end_f]
+                )
+                timestep = torch.zeros(latent_model_input.shape[0], device=device)
 
-            noise_pred, updated_kv_cache = self.model(
-                latent_model_input,
-                timestep,
-                prompt_embeds,
-                start_f=rope_start_f,
-                end_f=rope_end_f,
-                frame_index=frame_index,
-                save_kv_cache=True,
-                kv_cache=chunk_kv_cache,
-                mask=mask,
-                data_info=local_data_info,
-                **self.model_kwargs,
-            )
-            kv_cache[chunk_idx] = updated_kv_cache
-
-            if yield_save_separately:
-                yield None
+                noise_pred, updated_kv_cache = self.model(
+                    latent_model_input,
+                    timestep,
+                    prompt_embeds,
+                    start_f=rope_start_f,
+                    end_f=rope_end_f,
+                    frame_index=frame_index,
+                    save_kv_cache=True,
+                    kv_cache=chunk_kv_cache,
+                    mask=mask,
+                    data_info=local_data_info,
+                    **self.model_kwargs,
+                )
+                kv_cache[chunk_idx] = updated_kv_cache
             else:
-                yield chunk_idx, latents[:, :, start_f:end_f], start_f, end_f
+                kv_cache[chunk_idx] = [[None] * _NUM_CACHE_SLOTS for _ in range(self.num_model_blocks)]
+
+            yield chunk_idx, latents[:, :, start_f:end_f], start_f, end_f
 
     # ------------------------------------------------------------------
     # KV cache management
@@ -720,17 +719,27 @@ class SelfForcingFlowEulerCamCtrl(SelfForcingFlowEuler):
                 valid_cached_chunks = [0] + list(range(s, chunk_idx))
                 sink_num = self._chunk_indices[1] - self._chunk_indices[0]
 
+        valid_cached_chunks = [
+            i
+            for i in valid_cached_chunks
+            if kv_cache[i][0][_SLOT_K] is not None or kv_cache[i][0][_SLOT_TYPE_FLAG] is not None
+        ]
+
         # Count cached frames in latent units (independent of patch_size). The
         # sampler builds frame_index in latent units so this stays consistent.
         num_cached_frames = sum(self._chunk_indices[i + 1] - self._chunk_indices[i] for i in valid_cached_chunks)
+        prev_cache_idx = valid_cached_chunks[-1] if valid_cached_chunks else chunk_idx
 
         for block_id in range(self.num_model_blocks):
-            prev_last = kv_cache[chunk_idx - 1][block_id]
+            prev_last = kv_cache[prev_cache_idx][block_id]
 
             # Detect cache layout from type flag (slot 6).
             type_flag = prev_last[_SLOT_TYPE_FLAG] if prev_last[_SLOT_TYPE_FLAG] is not None else None
+            type_flag_value = None
+            if type_flag is not None:
+                type_flag_value = float(type_flag.item()) if isinstance(type_flag, torch.Tensor) else float(type_flag)
 
-            if type_flag is not None and type_flag.item() > 0.5:
+            if type_flag_value is not None and type_flag_value > 0.5:
                 # --- State-based (GDN): last chunk's state is the full history ---
                 # NOTE: ``CachedGLUMBConvTemp`` writes tconv state to
                 # ``kv_cache[-1]`` (slot 9), not ``_SLOT_TCONV`` (slot 5). We
@@ -749,7 +758,7 @@ class SelfForcingFlowEulerCamCtrl(SelfForcingFlowEuler):
                     prev_last[-1],  # FFN tconv state (slot 9)
                 ]
 
-            elif type_flag is not None:
+            elif type_flag_value is not None:
                 # --- Concat-based (Softmax): concatenate K/V across chunks ---
                 acc: list[torch.Tensor | None] = [None] * _NUM_CACHE_SLOTS
 
@@ -763,7 +772,7 @@ class SelfForcingFlowEulerCamCtrl(SelfForcingFlowEuler):
                             continue
                         # Softmax K/V are (B, H, N, D) — concat along dim 2.
                         if acc[s] is None:
-                            acc[s] = prev[s].clone()
+                            acc[s] = prev[s]
                         else:
                             acc[s] = torch.cat([acc[s], prev[s]], dim=2)
 
@@ -803,7 +812,7 @@ class SelfForcingFlowEulerCamCtrl(SelfForcingFlowEuler):
                             cat_dim = -1
 
                         if acc_legacy[s] is None:
-                            acc_legacy[s] = prev[s].clone()
+                            acc_legacy[s] = prev[s]
                         else:
                             acc_legacy[s] = torch.cat([acc_legacy[s], prev[s]], dim=cat_dim)
 

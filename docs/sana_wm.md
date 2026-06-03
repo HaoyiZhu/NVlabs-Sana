@@ -54,18 +54,27 @@ fetched on first use from
 python inference_video_scripts/inference_sana_wm.py \
   --image      asset/sana_wm/demo_0.png \
   --prompt     asset/sana_wm/demo_0.txt \
-  --action     "w-80,jw-40,w-40,lw-60,w-100" \
-  --translation_speed 0.055 \
-  --rotation_speed_deg 1.2 \
+  --action     "w-100,dw-60,w-100,aw-60" \
   --num_frames 321 \
   --output_dir results/sana_wm_demo
 ```
 
-Action DSL: each segment is `<keys>-<frames>` joined by commas. Movement keys
-`w` (forward), `a` (strafe left), `s` (back), `d` (strafe right) translate
-on the world horizontal plane; rotation keys `i` (pitch up), `k` (pitch
-down), `j` (yaw left), `l` (yaw right) act in the camera's local frame.
-`none-N` holds the pose for `N` frames.
+Action DSL: each segment is `<keys>-<frames>` joined by commas. The control
+scheme (shared with the interactive demo) is: `w` / `s` forward / back
+(translation along the heading), `a` / `d` yaw left / right (turn),
+`i` / `k` pitch up / down, `j` / `l` strafe left / right. `none-N` holds the
+pose for `N` frames. Held keys ease in/out with light inertia (instant on a
+fresh press, gentle coast on release); default speeds are gentle
+(`--translation_speed 0.025`, `--rotation_speed_deg 0.6`).
+
+> **⚠️ Mapping update (breaking change vs the first release).** The `--action`
+> keys were remapped so the demo and CLI share one control scheme: **`a` / `d`
+> now yaw** (previously strafe) and **`j` / `l` now strafe** (previously yaw);
+> `w` / `s` (forward/back) and `i` / `k` (pitch) are unchanged, and the old
+> implicit a/d→steer coupling is gone. Motion is also smoothed now and the
+> default speeds are gentler. **If you have action strings from the earlier
+> release, swap `a`/`d` ↔ `j`/`l`** to reproduce the same motion (the CLI also
+> prints this notice once when `--action` is used).
 
 ### Example 2 — image + prompt + camera trajectory (`.npy`)
 
@@ -84,6 +93,27 @@ matrices); `--intrinsics` is `.npy` of shape `(3, 3)`, `(F, 3, 3)`, or
 `(4,) = (fx, fy, cx, cy)` in input-image pixels. If `--intrinsics` is
 omitted we estimate it from `--image` with Pi3X and abort if the
 resulting FOV is outside `[25°, 120°]`.
+
+### Example gallery
+
+The release ships five first-frame + prompt + camera examples under
+`asset/sana_wm/` — `demo_{0..4}.{png,txt}`, each with a rolled-out `_pose.npy`
+trajectory and an `_intrinsics.npy`. Swap `demo_0` for any of them in the
+commands above (works for both the bidirectional and streaming scripts). The
+actions are gentle by design — slow forward drift with light left/right
+look-around.
+
+| Example | Scene | `--action` |
+|---------|-------|------------|
+| `demo_0` | salt-desert / black supercar | `w-100,dw-60,w-100,aw-60` |
+| `demo_1` | bioluminescent cave         | `w-35,aw-60,dw-100,aw-55,w-25,none-50` |
+| `demo_2` | mushroom forest / robot     | `w-25,aw-60,dw-100,aw-55,none-85` &nbsp;(+ `--translation_speed 0.015`) |
+| `demo_3` | salt flat / supercar        | `w-70,none-40,dw-35,w-70,aw-35,none-72` |
+| `demo_4` | ice plain / portal          | `w-95,aw-35,w-70,dw-35,none-87` |
+
+The `_pose.npy` files already bake in these actions (and `demo_2`'s slower
+speed), so `--camera asset/sana_wm/demo_N_pose.npy` reproduces the same motion
+as the matching `--action` string.
 
 ### Lower memory
 
@@ -110,7 +140,7 @@ HF repo) and run:
 python inference_video_scripts/inference_sana_wm_streaming.py \
   --image       asset/sana_wm/demo_0.png \
   --prompt      asset/sana_wm/demo_0.txt \
-  --action      "w-120,lw-80,w-100,jw-80,dw-100,w-120,aw-80,w-100,jw-60,w-121" \
+  --action      "w-300,dw-120,w-300,aw-120,w-120" \
   --num_frames  961 \
   --output_dir  results/sana_wm_streaming
 ```
@@ -121,10 +151,12 @@ on a single H100** after a one-time `torch.compile` warmup (~3 min cold, ~30 s
 warm cache; the warmup amortises across runs that reuse the same shapes).
 
 All speed-critical knobs are baked into the script as defaults — `torch.compile`
-on the VAE decoder and refiner transformer (`max-autotune-no-cudagraphs` mode),
-flash-only SDPA, Inductor `coordinate_descent_tuning` + `epilogue_fusion`, cuDNN
-benchmark, and the expandable CUDA allocator. There is no slow/fast toggle; the
-script is the fast config.
+on the **refiner transformer** (`max-autotune-no-cudagraphs` mode), flash-only
+SDPA, Inductor `coordinate_descent_tuning` + `epilogue_fusion`, cuDNN benchmark,
+and the expandable CUDA allocator. The causal VAE decoder is intentionally **not**
+compiled: `torch.compile` corrupts its cross-chunk causal cache (chunk 0 decodes
+fine but later chunks come out blank/gray), so it runs eager. There is no
+slow/fast toggle; the script is the fast config.
 
 Overrides for advanced use:
 
@@ -145,9 +177,9 @@ Overrides for advanced use:
 | `--image` | First-frame RGB image. Aspect-preserving resized + center-cropped to 704×1280. |
 | `--prompt` | UTF-8 text file with the conditioning prompt. |
 | `--camera` | `(F, 4, 4)` `.npy` camera-to-world matrices. Mutually exclusive with `--action`. |
-| `--action` | WASD/IJKL DSL. Rolled out via `action_string_to_c2w` to a `(F+1, 4, 4)` trajectory. |
-| `--translation_speed` | Per-frame translation magnitude (default `0.05`). |
-| `--rotation_speed_deg` | Per-frame rotation magnitude in degrees (default `1.2`). |
+| `--action` | Control DSL (`w/s` move, `a/d` yaw, `i/k` pitch, `j/l` strafe). Rolled out via `action_string_to_c2w` (smoothed) to a `(F+1, 4, 4)` trajectory. |
+| `--translation_speed` | Per-frame translation magnitude (default `0.025`). |
+| `--rotation_speed_deg` | Per-frame rotation magnitude in degrees (default `0.6`). |
 | `--intrinsics` | Optional `.npy` of shape `(3, 3)`, `(F, 3, 3)`, or `(4,)`. Pi3X-estimated if omitted. |
 | `--num_frames` | Total frames to generate (default `161`; the demos above use `321`). |
 | `--fps` | Output mp4 frame rate (default `16`). |
