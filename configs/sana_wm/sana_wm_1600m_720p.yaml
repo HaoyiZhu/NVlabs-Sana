@@ -5,7 +5,6 @@ model:
   mixed_precision: bf16
   fp32_attention: true
   multi_scale: true
-  camctrl_type: BidirectionalGDNUCPESinglePathLiteLABothTriton
   attn_type: BidirectionalGDNTriton
   softmax_every_n: 4
   linear_head_dim: 112
