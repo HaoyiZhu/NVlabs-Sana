@@ -39,8 +39,8 @@ if "--cuda_visible_devices" in sys.argv:
     if _i + 1 < len(sys.argv):
         os.environ["CUDA_VISIBLE_DEVICES"] = sys.argv[_i + 1]
 
-# Realtime (GB200 / 5090) optimisation defaults. NVFP4 is Blackwell-only; the
-# launch script force-disables it on non-Blackwell GPUs.
+# Realtime (GB200 / 5090) optimisation defaults. These are GPU-agnostic; the
+# Blackwell-only NVFP4 / fp8-KV knobs are auto-gated after torch import below.
 os.environ.setdefault("DPM_TQDM", "True")
 os.environ.setdefault("FUSED_GDN_PRECISION", "2")
 os.environ.setdefault("SANA_WM_TORCH_COMPILE_DYNAMIC", "0")
@@ -49,15 +49,12 @@ os.environ.setdefault("SANA_WM_TORCH_COMPILE_DYNAMIC", "0")
 os.environ.setdefault("SANA_WM_TORCH_COMPILE_TARGETS", "refiner")
 os.environ.setdefault("SANA_WM_STAGE1_KV_SAVE_STRIDE", "0")
 os.environ.setdefault("SANA_WM_STAGE1_LINEARIZE_FFN", "1")
-os.environ.setdefault("SANA_WM_STAGE1_NVFP4", "1")
 os.environ.setdefault("SANA_WM_STAGE1_NVFP4_MODE", "self_attn+cross+ffn")
 os.environ.setdefault("SANA_WM_STAGE1_NVFP4_TEXT_PAD_MULTIPLE", "8")
 os.environ.setdefault("SANA_WM_SDPA_D112_DIRECT", "1")
 os.environ.setdefault("SANA_WM_REFINER_ATTN_BACKEND", "_native_flash")
 os.environ.setdefault("SANA_WM_REFINER_SELF_ATTN_KERNEL", "flash_attn")
 os.environ.setdefault("SANA_WM_REFINER_CROSS_ATTN_KV_CACHE", "1")
-os.environ.setdefault("SANA_WM_REFINER_KV_CACHE_DTYPE", "fp8_e4m3fn")
-os.environ.setdefault("SANA_WM_REFINER_NVFP4", "1")
 os.environ.setdefault("SANA_WM_REFINER_PRECONCAT_PREFIX", "1")
 os.environ.setdefault("SANA_WM_REFINER_NO_CLONE_CAPTURED_KV", "1")
 os.environ.setdefault("SANA_WM_REFINER_CAPTURE_KV_ONLY_LAST", "1")
@@ -67,7 +64,6 @@ os.environ.setdefault("SANA_WM_STREAMING_PREDECODE_SINK", "1")
 # Interactive demo keeps the VAE decoder resident on GPU for low latency.
 os.environ.setdefault("SANA_WM_STREAMING_LAZY_VAE_DECODER", "0")
 os.environ.setdefault("SANA_WM_STREAMING_PROMPT_CACHE", "1")
-os.environ.setdefault("SANA_WM_TE_NVFP4_CPU_STAGING", "1")
 
 import argparse  # noqa: E402
 import asyncio  # noqa: E402
@@ -82,6 +78,28 @@ import torch  # noqa: E402
 import uvicorn  # noqa: E402
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, status  # noqa: E402
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response  # noqa: E402
+
+from sana.tools import is_blackwell  # noqa: E402
+
+# NVFP4 / fp8-KV are Blackwell-only (sm_100 B200/GB200, sm_120 5090/GB10). Enable
+# them automatically on Blackwell; on Hopper/Ada warn loudly and fall back to bf16
+# (these env vars are read at model-build time, so setting them post-torch is fine).
+if is_blackwell():
+    os.environ.setdefault("SANA_WM_STAGE1_NVFP4", "1")
+    os.environ.setdefault("SANA_WM_REFINER_NVFP4", "1")
+    os.environ.setdefault("SANA_WM_REFINER_KV_CACHE_DTYPE", "fp8_e4m3fn")
+    os.environ.setdefault("SANA_WM_TE_NVFP4_CPU_STAGING", "1")
+else:
+    os.environ.setdefault("SANA_WM_STAGE1_NVFP4", "0")
+    os.environ.setdefault("SANA_WM_REFINER_NVFP4", "0")
+    os.environ.setdefault("SANA_WM_REFINER_KV_CACHE_DTYPE", "bf16")
+    os.environ.setdefault("SANA_WM_TE_NVFP4_CPU_STAGING", "0")
+    print(
+        "[realtime-demo] WARNING: non-Blackwell GPU detected (NVFP4/fp8 need "
+        "sm_100/sm_120, e.g. B200/GB200/RTX-5090). NVFP4 is OFF and the demo "
+        "runs the bf16 path — markedly slower, will NOT reach realtime.",
+        flush=True,
+    )
 
 from diffusion.utils.logger import get_root_logger  # noqa: E402
 from app.sana_wm_interactive import (  # noqa: E402

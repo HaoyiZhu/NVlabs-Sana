@@ -70,6 +70,7 @@ from inference_video_scripts.streaming_pipeline import (
     StreamingPipelineConfig,
     run_streaming_inference,
 )
+from sana.tools import resolve_hf_path
 from inference_video_scripts.camera_control import (  # shared camera-control core (demo + inference)
     DEFAULT_PITCH_LIMIT_DEG,
     DEFAULT_ROTATION_SPEED_DEG,
@@ -87,6 +88,18 @@ from inference_video_scripts.camera_control import (  # shared camera-control co
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ASSET_DIR = REPO_ROOT / "asset" / "sana_wm"
 DEFAULT_STREAMING_ROOT = REPO_ROOT / "pretrained_models" / "sana_wm_streaming"
+
+# Streaming weights are auto-fetched from the Hub when the local bundle under
+# DEFAULT_STREAMING_ROOT is absent (mirrors the bidirectional inference path).
+HF_REPO = "Efficient-Large-Model/SANA-WM_streaming"
+HF_STREAMING_DEFAULTS = {
+    "sana_dit/model.pt": f"hf://{HF_REPO}/sana_dit/model.pt",
+    "ltx2_causal_vae": f"hf://{HF_REPO}/ltx2_causal_vae",
+    "refiner_diffusers": f"hf://{HF_REPO}/refiner_diffusers",
+    "gemma3_12b": f"hf://{HF_REPO}/gemma3_12b",
+}
+# The inference YAML ships in-repo (configs/sana_wm/), not in the weights repo.
+DEFAULT_CONFIG = REPO_ROOT / "configs" / "sana_wm" / "sana_wm_streaming_1600m_720p.yaml"
 
 FPS = 16
 NUM_FRAME_PER_BLOCK = 3
@@ -468,16 +481,29 @@ def _load_prompt(path: Path) -> str:
 
 
 def _resolve_paths(streaming_root: Path) -> tuple[Path, Path, Path, Path, Path]:
-    cfg = streaming_root / "sana_wm_streaming_1600m_720p.yaml"
-    model = streaming_root / "sana_dit" / "model.pt"
-    causal_vae = streaming_root / "ltx2_causal_vae"
-    refiner = streaming_root / "refiner_diffusers"
-    gemma = streaming_root / "gemma3_12b"
-    for label, p in [("config", cfg), ("model", model), ("causal_vae", causal_vae),
-                     ("refiner", refiner), ("gemma", gemma)]:
-        if not p.exists():
-            raise FileNotFoundError(f"streaming {label} not found at {p}")
-    return cfg, model, causal_vae, refiner, gemma
+    """Resolve the five checkpoint paths, local-first with an hf:// fallback.
+
+    A weight present under ``streaming_root`` wins (preserves the local-bundle
+    workflow); anything missing is snapshot-downloaded from
+    ``hf://Efficient-Large-Model/SANA-WM_streaming`` on first use. The YAML now
+    ships in-repo (configs/sana_wm/) and only falls back to the local bundle copy
+    when present there.
+    """
+    def _local_or_hf(rel: str) -> Path:
+        local = streaming_root / rel
+        if local.exists():
+            return local
+        return Path(resolve_hf_path(HF_STREAMING_DEFAULTS[rel]))
+
+    cfg_local = streaming_root / "sana_wm_streaming_1600m_720p.yaml"
+    cfg = cfg_local if cfg_local.exists() else DEFAULT_CONFIG
+    if not Path(cfg).exists():
+        raise FileNotFoundError(f"streaming config not found at {cfg_local} or {DEFAULT_CONFIG}")
+    model = _local_or_hf("sana_dit/model.pt")
+    causal_vae = _local_or_hf("ltx2_causal_vae")
+    refiner = _local_or_hf("refiner_diffusers")
+    gemma = _local_or_hf("gemma3_12b")
+    return Path(cfg), model, causal_vae, refiner, gemma
 
 
 def _apply_fast_defaults() -> None:

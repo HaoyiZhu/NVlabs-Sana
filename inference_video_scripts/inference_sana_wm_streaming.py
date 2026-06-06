@@ -57,6 +57,7 @@ import torch  # noqa: E402
 from PIL import Image  # noqa: E402
 
 from diffusion.utils.logger import get_root_logger  # noqa: E402
+from sana.tools import is_blackwell, resolve_hf_path  # noqa: E402
 from inference_video_scripts.inference_sana_wm import (  # noqa: E402
     GenerationParams,
     InferenceConfig,
@@ -74,8 +75,103 @@ from inference_video_scripts.inference_sana_wm import (  # noqa: E402
 # Canonical 4-step distilled-student schedule.
 DEFAULT_DENOISING_STEP_LIST = "1000,960,889,727,0"
 
-# Default location of the streaming weights bundle.
-DEFAULT_STREAMING_ROOT = Path("pretrained_models/sana_wm_streaming")
+# Full realtime NVFP4 preset, auto-applied on Blackwell GPUs (sm_100 B200/GB200,
+# sm_120 5090/GB10). Mirrors scripts/benchmark_sana_wm_5090_realtime.sh. Each var
+# is os.environ.setdefault'd, so anything you export by hand still wins.
+REALTIME_BLACKWELL_PRESET = {
+    "DPM_TQDM": "True",
+    "FUSED_GDN_PRECISION": "2",
+    "SANA_WM_TORCH_COMPILE_DYNAMIC": "0",
+    "SANA_WM_TORCH_COMPILE_TARGETS": "vae",
+    "SANA_WM_STAGE1_KV_SAVE_STRIDE": "0",
+    "SANA_WM_STAGE1_LINEARIZE_FFN": "1",
+    "SANA_WM_STAGE1_NVFP4": "1",
+    "SANA_WM_STAGE1_NVFP4_MODE": "self_attn+cross+ffn",
+    "SANA_WM_STAGE1_NVFP4_TEXT_PAD_MULTIPLE": "8",
+    "SANA_WM_SDPA_D112_DIRECT": "1",
+    "SANA_WM_REFINER_ATTN_BACKEND": "_native_flash",
+    "SANA_WM_REFINER_SELF_ATTN_KERNEL": "flash_attn",
+    "SANA_WM_REFINER_CROSS_ATTN_KV_CACHE": "1",
+    "SANA_WM_REFINER_EMPTY_CACHE_BEFORE_PREFIX": "0",
+    "SANA_WM_REFINER_EMPTY_CACHE_BEFORE_CAPTURE": "0",
+    "SANA_WM_REFINER_KV_CACHE_DTYPE": "fp8_e4m3fn",
+    "SANA_WM_REFINER_NVFP4": "1",
+    "SANA_WM_REFINER_PRECONCAT_PREFIX": "1",
+    "SANA_WM_REFINER_NO_CLONE_CAPTURED_KV": "1",
+    "SANA_WM_REFINER_CAPTURE_KV_ONLY_LAST": "1",
+    "SANA_WM_REFINER_FAST_KV_CAPTURE": "last_predict",
+    "SANA_WM_REFINER_FAST_KV_CLEAN_INTERVAL": "4",
+    "SANA_WM_STREAMING_PREDECODE_SINK": "1",
+    "SANA_WM_STREAMING_LAZY_VAE_DECODER": "1",
+    "SANA_WM_STREAMING_PROMPT_CACHE": "1",
+    "SANA_WM_TE_NVFP4_CPU_STAGING": "1",
+}
+# Refiner KV sliding-window (used when --refiner_kv_max_frames is unset). Must be
+# >= sink_size + refiner_block_size so each AR step still sees the full previous
+# block; a smaller window (e.g. 2 < 1 sink + 3 block) drops cross-chunk context
+# and makes the decoded video flicker at every chunk boundary. 11 keeps temporal
+# continuity while staying faster than realtime on Blackwell.
+DEFAULT_REFINER_KV_MAX_FRAMES = 11
+
+
+def _apply_realtime_nvfp4_defaults(logger: logging.Logger, *, disable: bool) -> bool:
+    """Auto-enable the realtime NVFP4 preset on Blackwell; warn otherwise.
+
+    Returns whether the NVFP4 realtime preset is active. ``disable`` (``--no_nvfp4``)
+    forces the bf16 path even on Blackwell. NVFP4 / fp8 kernels are Blackwell-only,
+    so on Hopper/Ada we emit a loud warning that realtime is not achievable.
+    """
+    blackwell = is_blackwell()
+    if disable:
+        if blackwell:
+            logger.info("[realtime] --no_nvfp4 set: skipping the Blackwell NVFP4 preset (bf16 path).")
+        return False
+    if blackwell:
+        for key, value in REALTIME_BLACKWELL_PRESET.items():
+            os.environ.setdefault(key, value)
+        logger.info(
+            "[realtime] Blackwell GPU detected -> NVFP4 realtime preset enabled "
+            "(stage-1 + refiner NVFP4, fp8 KV cache). Pass --no_nvfp4 to opt out."
+        )
+        return True
+    # Non-Blackwell: NVFP4 is unsupported. Pin the disable subset and warn loudly.
+    for key, value in (
+        ("SANA_WM_STAGE1_NVFP4", "0"),
+        ("SANA_WM_REFINER_NVFP4", "0"),
+        ("SANA_WM_REFINER_KV_CACHE_DTYPE", "bf16"),
+        ("SANA_WM_TE_NVFP4_CPU_STAGING", "0"),
+    ):
+        os.environ.setdefault(key, value)
+    logger.warning(
+        "[realtime] non-Blackwell GPU detected (NVFP4/fp8 kernels need sm_100/sm_120, "
+        "e.g. B200/GB200/RTX-5090). Running the bf16 path: NVFP4 quantization is OFF, "
+        "which is markedly slower and will NOT reach realtime throughput."
+    )
+    return False
+
+# Streaming weights are auto-fetched from the Hub on first use, mirroring the
+# bidirectional script. Each artefact resolves through ``resolve_hf_path`` so a
+# local path / bundle still wins when present (it returns existing local paths
+# unchanged and only snapshot-downloads bare ``hf://`` URIs).
+HF_REPO = "Efficient-Large-Model/SANA-WM_streaming"
+HF_STREAMING_DEFAULTS = {
+    "model_path": f"hf://{HF_REPO}/sana_dit/model.pt",
+    "causal_vae_path": f"hf://{HF_REPO}/ltx2_causal_vae",
+    "refiner_root": f"hf://{HF_REPO}/refiner_diffusers",
+    "gemma_root": f"hf://{HF_REPO}/gemma3_12b",
+}
+
+# The inference YAML ships in-repo (configs/sana_wm/), not in the weights repo.
+DEFAULT_CONFIG = (
+    Path(__file__).resolve().parents[1]
+    / "configs"
+    / "sana_wm"
+    / "sana_wm_streaming_1600m_720p.yaml"
+)
+
+# Optional LOCAL bundle dir (``--streaming_root``). Unset by default so the
+# hf:// defaults above drive a first-use download.
+DEFAULT_STREAMING_ROOT = None
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -109,27 +205,33 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--negative_prompt", default="")
 
-    # Streaming-only knobs.
+    # Streaming-only knobs. By default every weight is fetched from the Hub
+    # (hf://Efficient-Large-Model/SANA-WM_streaming) on first use; pass a local
+    # path / bundle to any of these to override.
     p.add_argument("--streaming_root", type=Path, default=DEFAULT_STREAMING_ROOT,
-                   help="Directory holding sana_dit/, ltx2_causal_vae/, refiner_diffusers/, gemma3_12b/, and the yaml.")
-    p.add_argument("--config", type=Path, default=None,
-                   help="Override the streaming YAML. Default: <streaming_root>/sana_wm_streaming_1600m_720p.yaml.")
-    p.add_argument("--model_path", type=Path, default=None,
-                   help="Override the streaming DiT checkpoint. Default: <streaming_root>/sana_dit/model.pt.")
-    p.add_argument("--causal_vae_path", type=Path, default=None,
-                   help="Override the causal LTX-2 VAE directory. Default: <streaming_root>/ltx2_causal_vae.")
-    p.add_argument("--refiner_root", type=Path, default=None,
-                   help="Override the chunk-causal refiner directory. Default: <streaming_root>/refiner_diffusers.")
-    p.add_argument("--refiner_gemma_root", type=Path, default=None,
-                   help="Override the Gemma diffusers root. Default: <streaming_root>/gemma3_12b.")
+                   help="Optional LOCAL bundle dir holding sana_dit/, ltx2_causal_vae/, refiner_diffusers/, gemma3_12b/. "
+                        f"If unset, each artefact is fetched from hf://{HF_REPO}.")
+    p.add_argument("--config", type=str, default=None,
+                   help="Streaming YAML (local path or hf:// URI). Default: in-repo configs/sana_wm/sana_wm_streaming_1600m_720p.yaml "
+                        "(or <streaming_root>/sana_wm_streaming_1600m_720p.yaml when --streaming_root is set).")
+    p.add_argument("--model_path", type=str, default=None,
+                   help=f"Override the streaming DiT checkpoint (local path or hf:// URI). Default: hf://{HF_REPO}/sana_dit/model.pt.")
+    p.add_argument("--causal_vae_path", type=str, default=None,
+                   help=f"Override the causal LTX-2 VAE (local path or hf:// URI). Default: hf://{HF_REPO}/ltx2_causal_vae.")
+    p.add_argument("--refiner_root", type=str, default=None,
+                   help=f"Override the chunk-causal refiner (local path or hf:// URI). Default: hf://{HF_REPO}/refiner_diffusers.")
+    p.add_argument("--refiner_gemma_root", type=str, default=None,
+                   help=f"Override the Gemma diffusers root (local path or hf:// URI). Default: hf://{HF_REPO}/gemma3_12b.")
     p.add_argument("--denoising_step_list", default=DEFAULT_DENOISING_STEP_LIST,
                    help="Comma-separated distilled-student timestep schedule (must end with 0).")
     p.add_argument("--num_frame_per_block", type=int, default=3,
                    help="Latent frames per stage-1 AR chunk (must match the model's chunk_size).")
     p.add_argument("--refiner_block_size", type=int, default=3,
                    help="Refiner latent frames per AR block.")
-    p.add_argument("--refiner_kv_max_frames", type=int, default=11,
+    p.add_argument("--refiner_kv_max_frames", type=int, default=DEFAULT_REFINER_KV_MAX_FRAMES,
                    help="Refiner KV sliding-window size (sink + history + active).")
+    p.add_argument("--no_nvfp4", action="store_true",
+                   help="Force the bf16 path even on Blackwell (skip the auto NVFP4 realtime preset).")
     p.add_argument("--refiner_seed", type=int, default=42)
     p.add_argument("--sink_size", type=int, default=1)
     p.add_argument("--no_sink_token", action="store_true",
@@ -169,13 +271,29 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _resolve_streaming_paths(args: argparse.Namespace) -> tuple[Path, Path, Path, Path, Path]:
-    """Materialise the five checkpoint paths from --streaming_root + overrides."""
+    """Materialise the five checkpoint paths, fetching from the Hub on first use.
+
+    With ``--streaming_root`` set we read a LOCAL bundle (back-compat); otherwise
+    each artefact falls back to its ``hf://`` default. Every path is then passed
+    through :func:`resolve_hf_path` — local paths are returned unchanged, bare
+    ``hf://`` URIs are snapshot-downloaded — and checked for existence so a bad
+    local override still fails loudly.
+    """
     root = args.streaming_root
-    config_path = args.config or (root / "sana_wm_streaming_1600m_720p.yaml")
-    model_path = args.model_path or (root / "sana_dit" / "model.pt")
-    causal_vae_path = args.causal_vae_path or (root / "ltx2_causal_vae")
-    refiner_root = args.refiner_root or (root / "refiner_diffusers")
-    gemma_root = args.refiner_gemma_root or (root / "gemma3_12b")
+    if root is not None:
+        config_path = args.config or str(root / "sana_wm_streaming_1600m_720p.yaml")
+        model_path = args.model_path or str(root / "sana_dit" / "model.pt")
+        causal_vae_path = args.causal_vae_path or str(root / "ltx2_causal_vae")
+        refiner_root = args.refiner_root or str(root / "refiner_diffusers")
+        gemma_root = args.refiner_gemma_root or str(root / "gemma3_12b")
+    else:
+        config_path = args.config or str(DEFAULT_CONFIG)
+        model_path = args.model_path or HF_STREAMING_DEFAULTS["model_path"]
+        causal_vae_path = args.causal_vae_path or HF_STREAMING_DEFAULTS["causal_vae_path"]
+        refiner_root = args.refiner_root or HF_STREAMING_DEFAULTS["refiner_root"]
+        gemma_root = args.refiner_gemma_root or HF_STREAMING_DEFAULTS["gemma_root"]
+
+    resolved: dict[str, Path] = {}
     for label, path in (
         ("--config", config_path),
         ("--model_path", model_path),
@@ -183,9 +301,17 @@ def _resolve_streaming_paths(args: argparse.Namespace) -> tuple[Path, Path, Path
         ("--refiner_root", refiner_root),
         ("--refiner_gemma_root", gemma_root),
     ):
-        if not Path(path).exists():
+        local = resolve_hf_path(str(path))
+        if not Path(local).exists():
             raise SystemExit(f"{label} does not exist: {path}")
-    return config_path, model_path, causal_vae_path, refiner_root, gemma_root
+        resolved[label] = Path(local)
+    return (
+        resolved["--config"],
+        resolved["--model_path"],
+        resolved["--causal_vae_path"],
+        resolved["--refiner_root"],
+        resolved["--refiner_gemma_root"],
+    )
 
 
 def _apply_fast_defaults() -> None:
@@ -211,6 +337,11 @@ def main() -> None:
     logger: logging.Logger = get_root_logger()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _apply_fast_defaults()
+
+    # Realtime path: auto-enable the NVFP4 preset on Blackwell (warn + bf16 fallback
+    # elsewhere). Must run before the pipeline is built (refiner reads NVFP4 env in
+    # __init__).
+    _apply_realtime_nvfp4_defaults(logger, disable=args.no_nvfp4)
 
     image = Image.open(args.image).convert("RGB")
     prompt = args.prompt.read_text(encoding="utf-8", errors="replace").strip()

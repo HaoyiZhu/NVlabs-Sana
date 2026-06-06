@@ -49,7 +49,9 @@ dependencies = [
     "triton==3.5.1",
     "wandb",
     "webdataset",
-    "xformers==0.0.33.post2",
+    # xformers ships x86_64 wheels only; SANA-WM runs with DISABLE_XFORMERS=1, so
+    # it is skipped on aarch64 (Grace-Blackwell), where no wheel exists.
+    "xformers==0.0.33.post2; platform_machine == 'x86_64'",
     "yapf",
     "spaces",
     "matplotlib",

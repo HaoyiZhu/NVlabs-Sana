@@ -41,6 +41,11 @@ bash ./environment_setup.sh sana
 conda activate sana
 ```
 
+The installer auto-selects the CUDA flavour by host architecture — cu128 / CUDA
+12.8 on x86_64 (H100, Ada), cu130 / CUDA 13.0 on aarch64 (GB200 / Grace-Blackwell)
+— and installs [Transformer Engine](https://github.com/NVIDIA/TransformerEngine),
+which the NVFP4 realtime path requires (see [Realtime on Blackwell](#realtime-on-blackwell-auto-nvfp4)).
+
 ## 🏃 Inference
 
 All Stage-1 / Stage-2 weights, the VAE, and the LTX-2 Gemma text encoder are
@@ -131,10 +136,11 @@ MP4. Stage 1 runs the 4-step distilled student (CFG-baked-in, runs at
 `cfg_scale=1`), the refiner runs chunk-causal AR with a sliding KV window, and
 the causal LTX-2 VAE decodes chunk-by-chunk.
 
-Drop the streaming weights into `pretrained_models/sana_wm_streaming/` (DiT,
-refiner, causal VAE, and YAML are all under the
+All streaming weights (DiT, causal VAE, refiner, and the Gemma text encoder)
+are fetched on first use from
 [`SANA-WM_streaming`](https://huggingface.co/Efficient-Large-Model/SANA-WM_streaming)
-HF repo) and run:
+— no manual download required, exactly like the bidirectional path. The
+inference YAML ships in-repo under `configs/sana_wm/`. Just run:
 
 ```bash
 python inference_video_scripts/inference_sana_wm_streaming.py \
@@ -158,13 +164,29 @@ compiled: `torch.compile` corrupts its cross-chunk causal cache (chunk 0 decodes
 fine but later chunks come out blank/gray), so it runs eager. There is no
 slow/fast toggle; the script is the fast config.
 
+### ⭐ Realtime on Blackwell (auto NVFP4) — recommended
+
+**This is the recommended way to run SANA-WM.** On a **Blackwell** GPU the
+streaming script and the realtime demo auto-detect the hardware and enable the
+NVFP4 realtime preset (stage-1 + refiner NVFP4 + fp8 KV cache) by default — no
+flags needed. In steady state it generates 720p video at **~1.4× realtime on a
+single GB200** (≈23 fps). The same path **deploys realtime on a single
+RTX 5090** (also Blackwell, 32 GB) — the fp8 KV cache and 4-bit weights keep it
+within the 5090's memory budget.
+
+Pass `--no_nvfp4` to force the bf16 path. On non-Blackwell GPUs (e.g. H100)
+NVFP4/fp8 are unsupported, so the script **warns and falls back to bf16**, which
+is markedly slower and will not reach realtime.
+
 Overrides for advanced use:
 
-- `--streaming_root <path>` — directory holding `sana_dit/`, `ltx2_causal_vae/`,
-  `refiner_diffusers/`, `gemma3_12b/`, and the YAML (default
-  `pretrained_models/sana_wm_streaming`).
+- `--streaming_root <path>` — optional LOCAL bundle dir holding `sana_dit/`,
+  `ltx2_causal_vae/`, `refiner_diffusers/`, `gemma3_12b/`. Unset by default, in
+  which case each artefact is pulled from `hf://Efficient-Large-Model/SANA-WM_streaming`.
 - `--config / --model_path / --causal_vae_path / --refiner_root /
-  --refiner_gemma_root` — point at non-default weight paths.
+  --refiner_gemma_root` — point at non-default weight paths (local path or
+  `hf://` URI). `--config` defaults to the in-repo
+  `configs/sana_wm/sana_wm_streaming_1600m_720p.yaml`.
 - `--num_frame_per_block` (default 3, must match the checkpoint's
   `chunk_size`), `--denoising_step_list` (default
   `"1000,960,889,727,0"`), `--refiner_block_size` (3), `--refiner_kv_max_frames`
@@ -212,7 +234,10 @@ Overrides for advanced use:
 | Chunk-causal Sana DiT (distilled) | `sana_dit/model.pt` |
 | Causal LTX-2 VAE | `ltx2_causal_vae/` |
 | Chunk-causal LTX-2 refiner | `refiner_diffusers/{transformer,connectors}/` |
-| Inference config | `sana_wm_streaming_1600m_720p.yaml` |
+| Gemma-3-12B text encoder (refiner) | `gemma3_12b/` |
+
+The inference config ships in-repo at
+`configs/sana_wm/sana_wm_streaming_1600m_720p.yaml` (not in the weights repo).
 
 The Sana text encoder (`gemma-2-2b-it`) is fetched separately from
 `Efficient-Large-Model/gemma-2-2b-it`.

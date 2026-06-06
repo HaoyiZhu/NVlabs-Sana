@@ -50,4 +50,6 @@ export SANA_WM_TE_NVFP4_CPU_STAGING="${SANA_WM_TE_NVFP4_CPU_STAGING:-1}"
 OUT_DIR="${OUT_DIR:-benchmark_outputs/x5_5090_realtime_${NUM_FRAMES}_${OUTPUT_MODE}_$(date +%Y%m%d_%H%M%S)}"
 export OUT_DIR
 
-exec scripts/benchmark_sana_wm_streaming.sh --refiner_kv_max_frames "${REFINER_KV_MAX_FRAMES:-2}" "$@"
+# KV window must stay >= sink + block (else cross-chunk context is lost and the
+# video flickers at chunk boundaries); 11 keeps continuity and still realtime.
+exec scripts/benchmark_sana_wm_streaming.sh --refiner_kv_max_frames "${REFINER_KV_MAX_FRAMES:-11}" "$@"
