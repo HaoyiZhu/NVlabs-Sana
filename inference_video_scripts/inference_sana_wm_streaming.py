@@ -76,8 +76,8 @@ from inference_video_scripts.inference_sana_wm import (  # noqa: E402
 DEFAULT_DENOISING_STEP_LIST = "1000,960,889,727,0"
 
 # Full realtime NVFP4 preset, auto-applied on Blackwell GPUs (sm_100 B200/GB200,
-# sm_120 5090/GB10). Mirrors scripts/benchmark_sana_wm_5090_realtime.sh. Each var
-# is os.environ.setdefault'd, so anything you export by hand still wins.
+# sm_120 5090/GB10). Each var is os.environ.setdefault'd, so anything you export
+# by hand still wins.
 REALTIME_BLACKWELL_PRESET = {
     "DPM_TQDM": "True",
     "FUSED_GDN_PRECISION": "2",
