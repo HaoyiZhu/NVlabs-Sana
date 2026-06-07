@@ -76,6 +76,28 @@ fp32 contiguous, Triton fallback otherwise).
 - A CUDA cam Phase B (to drop the fp32 M_hist→bf16 copy) needs **fp32** M-state
   (96 KB smem opt-in); the bf16-state attempt drifted (max_rel 0.14) and was slow.
 
+## Exploration: CUDA-only & Blackwell-specific optimizations
+- **CUDA-only wins already captured** (things Triton's per-op Python wrapper
+  cannot do): fuse the `num/(den+eps)` divide into Phase C (full path); read
+  q/k/v `[B,H,D,N]` directly + write the transposed fp32 output directly (cam),
+  removing ~3.5ms of packing/transpose glue; d-major coalesced staging +
+  col-major coalesced output. These ARE the CUDA-unique speedups.
+- **Blackwell FP8/FP4 (5th-gen TC headline) — NOT viable here.** `fp8_probe.py`:
+  e4m3-quantizing the cam GEMM operands gives **7.9–9.6% mean output error** vs
+  **1.0%** for bf16 (bar = 3%). The delta-rule `(I−βkkᵀ)` is a near-identity
+  contraction, so fp8's ~3-bit mantissa compounds over the F=11 frame recurrence.
+  → bf16 is required; the right Blackwell primitive is the bf16 5th-gen TC (used).
+- **sm_120 (consumer Blackwell) device facts:** 170 SMs, 48KB default / 100KB
+  opt-in smem, 64K regs/SM, 1536 thr/SM, **no thread-block clusters / tensor
+  memory** (those are sm_100 datacenter only). So distributed-smem megakernels
+  aren't available; occupancy is reg+smem bound (8 wmma acc-frags = 64 regs is
+  the floor → 33% occ is the cam_phase_a sweet spot; raising it spills or slows).
+- **Remaining CUDA-only frontier:** a persistent producer→consumer megakernel
+  fusing Phase B (serial scan) + Phase C (the `dev/v2v/bench_phase_bc_persistent_*`
+  POC direction) — removes the Phase-B launch + fp32 `M_hist` HBM roundtrip and
+  overlaps B's under-utilized serial scan with C's throughput. Quantified upside
+  on cam is small (~0.06 ms of 0.49 ms ≈ 1.1×) at high complexity/risk; offered.
+
 ## Build note
 svideo conda nvcc ships without usable headers; pip CUDA headers are fragmented.
 Build against the full system toolkit `/usr/local/cuda-12.9` (see cuda_impl.build).
