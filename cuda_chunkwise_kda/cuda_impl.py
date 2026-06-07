@@ -1,0 +1,788 @@
+"""CUDA candidate for chunkwise BiGDN forward (RTX 5090 / sm_120).
+
+Staged port. `run_cuda(inp, mode)` lets us swap each phase Triton<->CUDA:
+  mode="c"   : Triton A + Triton B + CUDA Phase-C-fused(+divide)   [Stage 1]
+  mode="bc"  : Triton A + CUDA B + CUDA C                          [Stage 2]
+  mode="all" : full CUDA                                           [Stage 3]
+Correctness is validated phase-by-phase against Triton in the harness.
+"""
+from __future__ import annotations
+
+import os
+import torch
+from torch.utils.cpp_extension import load_inline
+
+from diffusion.model.ops.fused_gdn_chunkwise import phase_a, phase_b_triton, phase_c
+
+_EXT = None
+
+CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
+#include <mma.h>
+
+using namespace nvcuda;
+using bf16 = __nv_bfloat16;
+
+namespace {
+
+constexpr int D = 128;
+constexpr int WM = 16;                 // wmma tile
+constexpr int KT = D / WM;             // 8 k-tiles
+constexpr int NCT = D / WM;            // 8 column tiles (output dim)
+constexpr int ROWS = 64;               // s-rows per CTA
+constexpr int RT = ROWS / WM;          // 4 row tiles
+constexpr int WARPS = 8;
+constexpr int THREADS = WARPS * 32;
+
+// ───────────────────────── Phase C + fused divide ─────────────────────────
+// Grid (BH*F, S_TILES): one CTA per (bh,f,s-tile of ROWS rows). M kept OUT of
+// smem (it is bf16 in HBM, ~14MB total -> L2-resident); wmma b-fragments load
+// directly from global so occupancy is set by the small Q working set, not by
+// the 32KB M. den[r] = sum_d Q*z; out = num/(den+eps) bf16 to [B,N,H,D].
+__global__ void phase_c_fused_kernel(
+    const bf16* __restrict__ qkv, // [B,N,3,H,D]
+    long sb, long sn, long s3, long sh, long sd,
+    const float* __restrict__ q_inv_rms, // [B,N]
+    const float* __restrict__ q_norm_w,  // [H*D]
+    const float* __restrict__ rope_cos,  // [N,D]
+    const float* __restrict__ rope_sin,  // [N,D]
+    const bf16*  __restrict__ M,          // [BH,F,D,D] bf16
+    const float* __restrict__ z,          // [BH,F,D]
+    bf16* __restrict__ out,               // [B,N,H,D]
+    int B, int H, int F, int S, int S_TILES, float eps) {
+  const int bhf = blockIdx.x;           // 0..BH*F-1
+  const int s_tile = blockIdx.y;        // 0..S_TILES-1
+  const int bh = bhf / F;
+  const int f  = bhf % F;
+  const int b  = bh / H;
+  const int h  = bh % H;
+  const int N  = F * S;
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const int s0 = s_tile * ROWS;
+
+  extern __shared__ char smem_raw[];
+  float* z_s    = reinterpret_cast<float*>(smem_raw);          // D floats
+  float* qnw_s  = z_s + D;                                     // D floats
+  bf16*  Qrot_s = reinterpret_cast<bf16*>(qnw_s + D);          // ROWS*D bf16
+  float* den_s  = reinterpret_cast<float*>(Qrot_s + ROWS * D); // ROWS floats
+
+  const bf16*  M_f = M + (long)bhf * D * D;
+  const float* z_f = z + (long)bhf * D;
+
+  for (int i = tid; i < D; i += THREADS) { z_s[i] = z_f[i]; qnw_s[i] = q_norm_w[h * D + i]; }
+  __syncthreads();
+
+  const bf16* qkv_q = qkv + (long)b * sb + 0 * s3 + (long)h * sh;
+  const int n_base = f * S;
+
+  // ── Qrot = relu(Qn)*cos + relu(Qn[d^1])*sin, all in fp32 (match Triton) ──
+  for (int idx = tid; idx < ROWS * D; idx += THREADS) {
+    const int r = idx >> 7, d = idx & 127, s = s0 + r;
+    float qrot = 0.f;
+    if (s < S) {
+      const int n = n_base + s;
+      const float invrms = q_inv_rms[b * N + n];
+      const long base = (long)n * sn;
+      float qd  = __bfloat162float(qkv_q[base + (long)d * sd]) * invrms * qnw_s[d];
+      float qd1 = __bfloat162float(qkv_q[base + (long)(d ^ 1) * sd]) * invrms * qnw_s[d ^ 1];
+      qd  = qd  > 0.f ? qd  : 0.f;
+      qd1 = qd1 > 0.f ? qd1 : 0.f;
+      qrot = qd * rope_cos[(long)n * D + d] + qd1 * rope_sin[(long)n * D + d];
+    }
+    Qrot_s[idx] = __float2bfloat16(qrot);
+  }
+  // den uses fp32 Q (match Triton) — recompute qv from global (qkv is L1/L2-hot).
+  for (int r = warp; r < ROWS; r += WARPS) {
+    const int s = s0 + r;
+    float acc = 0.f;
+    if (s < S) {
+      const int n = n_base + s;
+      const float invrms = q_inv_rms[b * N + n];
+      for (int d = lane; d < D; d += 32) {
+        float qn = __bfloat162float(qkv_q[(long)n * sn + (long)d * sd]) * invrms * qnw_s[d];
+        float qv = qn > 0.f ? qn : 0.f;
+        acc += qv * z_s[d];
+      }
+      #pragma unroll
+      for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffff, acc, o);
+    }
+    if (lane == 0) den_s[r] = acc;
+  }
+  __syncthreads();
+
+  // ── num = Qrot @ M (b-frag from global/L2). warp w owns col-tile w. ──
+  const int ct = warp;                  // 0..7
+  __shared__ float tile_smem[WARPS][WM * WM];
+  wmma::fragment<wmma::accumulator, WM, WM, WM, float> acc[RT];
+  #pragma unroll
+  for (int rt = 0; rt < RT; ++rt) wmma::fill_fragment(acc[rt], 0.f);
+  #pragma unroll
+  for (int kt = 0; kt < KT; ++kt) {
+    wmma::fragment<wmma::matrix_b, WM, WM, WM, bf16, wmma::row_major> b_frag;
+    wmma::load_matrix_sync(b_frag, M_f + (kt * WM) * D + ct * WM, D);
+    #pragma unroll
+    for (int rt = 0; rt < RT; ++rt) {
+      wmma::fragment<wmma::matrix_a, WM, WM, WM, bf16, wmma::row_major> a_frag;
+      wmma::load_matrix_sync(a_frag, Qrot_s + (rt * WM) * D + kt * WM, D);
+      wmma::mma_sync(acc[rt], a_frag, b_frag, acc[rt]);
+    }
+  }
+  #pragma unroll
+  for (int rt = 0; rt < RT; ++rt) {
+    wmma::store_matrix_sync(tile_smem[warp], acc[rt], WM, wmma::mem_row_major);
+    __syncwarp();
+    for (int i = lane; i < WM * WM; i += 32) {
+      const int rr = i >> 4, cc = i & 15;
+      const int s = s0 + rt * WM + rr;
+      if (s < S) {
+        const int n = n_base + s;
+        const int d = ct * WM + cc;
+        out[(((long)b * N + n) * H + h) * D + d] =
+            __float2bfloat16(tile_smem[warp][i] / (den_s[rt * WM + rr] + eps));
+      }
+    }
+    __syncwarp();
+  }
+}
+
+// ───────────────────────── Phase A — KV stream ─────────────────────────
+// Per (bh,f): I_P_kv[D,D]=I-K_rot^T diag(b) K_rot, A[D,D]=K_rot^T diag(b) V.
+// grid (BH*F,), 16 warps (512 thr). warp w owns (output=w>>3, row-tile=w&7) and
+// its 8 col-tiles -> 8 acc frags/warp (avoids register spills). Krot prep shared.
+constexpr int AW_KV = 16;
+constexpr int ATH_KV = AW_KV * 32;
+constexpr int ACHUNK = 32;            // S-rows staged per sync cycle
+constexpr int ASUB = ACHUNK / WM;     // wmma k-subtiles per chunk
+__global__ __launch_bounds__(ATH_KV) void phase_a_kv_kernel(
+    const bf16* __restrict__ qkv, long sb, long sn, long s3, long sh, long sd,
+    const float* __restrict__ beta,       // [BH, F*S]
+    const float* __restrict__ k_inv_rms,  // [B, N]
+    const float* __restrict__ k_norm_w,   // [H*D]
+    const float* __restrict__ rope_cos,   // [N,D]
+    const float* __restrict__ rope_sin,   // [N,D]
+    bf16* __restrict__ I_P_kv,            // [BH,F,D,D]
+    bf16* __restrict__ A,                 // [BH,F,D,D]
+    int B, int H, int F, int S, float k_scale) {
+  const int bhf = blockIdx.x, bh = bhf / F, f = bhf % F, b = bh / H, h = bh % H;
+  const int N = F * S, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const int out_sel = warp >> 3;   // 0=P_kv, 1=A
+  const int rt = warp & 7;         // row-tile (d in [16*rt, 16*rt+16))
+
+  extern __shared__ char sm[];
+  float* K_t  = reinterpret_cast<float*>(sm);          // [ACHUNK,D] fp32
+  float* knw  = K_t + ACHUNK * D;                       // [D]
+  bf16*  Krot = reinterpret_cast<bf16*>(knw + D);       // [ACHUNK,D]
+  bf16*  bKrot= Krot + ACHUNK * D;                      // [ACHUNK,D]
+  bf16*  bV   = bKrot + ACHUNK * D;                      // [ACHUNK,D]
+
+  for (int i = tid; i < D; i += ATH_KV) knw[i] = k_norm_w[h * D + i];
+
+  wmma::fragment<wmma::accumulator, WM, WM, WM, float> acc[NCT];
+  #pragma unroll
+  for (int ct = 0; ct < NCT; ++ct) wmma::fill_fragment(acc[ct], 0.f);
+
+  const bf16* qkv_k = qkv + (long)b * sb + 1 * s3 + (long)h * sh;
+  const bf16* qkv_v = qkv + (long)b * sb + 2 * s3 + (long)h * sh;
+  const float* beta_bhf = beta + (long)bh * N + (long)f * S;
+  const int n_base = f * S;
+  __syncthreads();
+
+  for (int s0 = 0; s0 < S; s0 += ACHUNK) {
+    for (int idx = tid; idx < ACHUNK * D; idx += ATH_KV) {
+      const int sl = idx >> 7, d = idx & 127, s = s0 + sl;
+      float kv = 0.f;
+      if (s < S) {
+        const int n = n_base + s;
+        float kn = __bfloat162float(qkv_k[(long)n * sn + (long)d * sd]) * k_inv_rms[b * N + n] * knw[d];
+        kv = (kn > 0.f ? kn : 0.f) * k_scale;
+      }
+      K_t[idx] = kv;
+    }
+    __syncthreads();
+    for (int idx = tid; idx < ACHUNK * D; idx += ATH_KV) {
+      const int sl = idx >> 7, d = idx & 127, s = s0 + sl;
+      float krot = 0.f;
+      if (s < S) {
+        const int n = n_base + s;
+        const float be = beta_bhf[s];
+        krot = K_t[sl * D + d] * rope_cos[(long)n * D + d]
+             + K_t[sl * D + (d ^ 1)] * rope_sin[(long)n * D + d];
+        bV[idx] = __float2bfloat16(be * __bfloat162float(qkv_v[(long)n * sn + (long)d * sd]));
+        bKrot[idx] = __float2bfloat16(be * krot);
+      } else { bV[idx] = __float2bfloat16(0.f); bKrot[idx] = __float2bfloat16(0.f); }
+      Krot[idx] = __float2bfloat16(krot);
+    }
+    __syncthreads();
+    const bf16* bsrc = out_sel ? bV : bKrot;
+    #pragma unroll
+    for (int ks = 0; ks < ASUB; ++ks) {
+      wmma::fragment<wmma::matrix_a, WM, WM, WM, bf16, wmma::col_major> a_frag;
+      wmma::load_matrix_sync(a_frag, Krot + ks * WM * D + rt * WM, D);
+      #pragma unroll
+      for (int ct = 0; ct < NCT; ++ct) {
+        wmma::fragment<wmma::matrix_b, WM, WM, WM, bf16, wmma::row_major> bfr;
+        wmma::load_matrix_sync(bfr, bsrc + ks * WM * D + ct * WM, D);
+        wmma::mma_sync(acc[ct], a_frag, bfr, acc[ct]);
+      }
+    }
+    __syncthreads();
+  }
+
+  bf16* dst = (out_sel ? A : I_P_kv) + (long)bhf * D * D;
+  __shared__ float st[AW_KV][WM * WM];
+  #pragma unroll
+  for (int ct = 0; ct < NCT; ++ct) {
+    wmma::store_matrix_sync(st[warp], acc[ct], WM, wmma::mem_row_major);
+    __syncwarp();
+    for (int i = lane; i < WM * WM; i += 32) {
+      const int d = rt * WM + (i >> 4), dp = ct * WM + (i & 15);
+      float v = st[warp][i];
+      if (out_sel == 0) v = (d == dp ? 1.f : 0.f) - v;   // I - P_kv
+      dst[(long)d * D + dp] = __float2bfloat16(v);
+    }
+    __syncwarp();
+  }
+}
+
+// ───────────────────────── Phase A — Z stream ─────────────────────────
+// Per (bh,f): I_P_z[D,D]=I-K^T diag(b) K (no RoPE), B[D]=sum_s b_s K_s.
+__global__ void phase_a_z_kernel(
+    const bf16* __restrict__ qkv, long sb, long sn, long s3, long sh, long sd,
+    const float* __restrict__ beta,
+    const float* __restrict__ k_inv_rms,
+    const float* __restrict__ k_norm_w,
+    bf16* __restrict__ I_P_z,             // [BH,F,D,D]
+    float* __restrict__ Bz,               // [BH,F,D]
+    int B, int H, int F, int S, float k_scale) {
+  const int bhf = blockIdx.x, bh = bhf / F, f = bhf % F, b = bh / H, h = bh % H;
+  const int N = F * S, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+
+  extern __shared__ char sm[];
+  bf16*  K_s  = reinterpret_cast<bf16*>(sm);            // [ACHUNK,D] bf16 (K)
+  bf16*  bK   = K_s + ACHUNK * D;                        // [ACHUNK,D] bf16 (beta*K)
+  float* knw  = reinterpret_cast<float*>(bK + ACHUNK * D); // [D]
+  float* Bacc = knw + D;                                 // [D]
+
+  for (int i = tid; i < D; i += THREADS) { knw[i] = k_norm_w[h * D + i]; Bacc[i] = 0.f; }
+
+  wmma::fragment<wmma::accumulator, WM, WM, WM, float> acc_p[NCT];
+  #pragma unroll
+  for (int ct = 0; ct < NCT; ++ct) wmma::fill_fragment(acc_p[ct], 0.f);
+
+  const bf16* qkv_k = qkv + (long)b * sb + 1 * s3 + (long)h * sh;
+  const float* beta_bhf = beta + (long)bh * N + (long)f * S;
+  const int n_base = f * S;
+  __syncthreads();
+
+  for (int s0 = 0; s0 < S; s0 += ACHUNK) {
+    for (int idx = tid; idx < ACHUNK * D; idx += THREADS) {
+      const int sl = idx >> 7, d = idx & 127, s = s0 + sl;
+      float kvv = 0.f, be = 0.f;
+      if (s < S) {
+        const int n = n_base + s;
+        float kn = __bfloat162float(qkv_k[(long)n * sn + (long)d * sd]) * k_inv_rms[b * N + n] * knw[d];
+        kvv = (kn > 0.f ? kn : 0.f) * k_scale;
+        be = beta_bhf[s];
+      }
+      K_s[idx] = __float2bfloat16(kvv);
+      const float bk = be * kvv;
+      bK[idx] = __float2bfloat16(bk);
+      if (s < S) atomicAdd(&Bacc[d], bk);
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int ks = 0; ks < ASUB; ++ks) {
+      wmma::fragment<wmma::matrix_a, WM, WM, WM, bf16, wmma::col_major> a_frag;
+      wmma::load_matrix_sync(a_frag, K_s + ks * WM * D + warp * WM, D);
+      #pragma unroll
+      for (int ct = 0; ct < NCT; ++ct) {
+        wmma::fragment<wmma::matrix_b, WM, WM, WM, bf16, wmma::row_major> bp;
+        wmma::load_matrix_sync(bp, bK + ks * WM * D + ct * WM, D);
+        wmma::mma_sync(acc_p[ct], a_frag, bp, acc_p[ct]);
+      }
+    }
+    __syncthreads();
+  }
+
+  bf16* IPz = I_P_z + (long)bhf * D * D;
+  __shared__ float st[WARPS][WM * WM];
+  #pragma unroll
+  for (int ct = 0; ct < NCT; ++ct) {
+    wmma::store_matrix_sync(st[warp], acc_p[ct], WM, wmma::mem_row_major);
+    __syncwarp();
+    for (int i = lane; i < WM * WM; i += 32) {
+      const int d = warp * WM + (i >> 4), dp = ct * WM + (i & 15);
+      IPz[(long)d * D + dp] = __float2bfloat16((d == dp ? 1.f : 0.f) - st[warp][i]);
+    }
+    __syncwarp();
+  }
+  for (int i = tid; i < D; i += THREADS) Bz[(long)bhf * D + i] = Bacc[i];
+}
+
+// ═══════════════════ CAM path (live model) — no prep, [B,H,D,N] ═══════════════════
+// cam_scan_bidi_chunkwise: identity norm/RoPE, skip_relu, skip_z, num_only,
+// output transposed to [B,H,D,N]. K_rot==K==raw k. Reads q/k/v directly (no
+// packing), writes fp32 out directly (no permute). 16 warps; warp w owns
+// (out=w>>3 {P_kv,A}, row-tile=w&7).
+__global__ __launch_bounds__(ATH_KV) void cam_phase_a_kv_kernel(
+    const float* __restrict__ k,   // [B,H,D,N]
+    const float* __restrict__ v,   // [B,H,D,N]
+    const float* __restrict__ beta, // [BH,F,S]
+    bf16* __restrict__ I_P_kv, bf16* __restrict__ A,
+    int B, int H, int F, int S) {
+  const int bhf = blockIdx.x, bh = bhf / F, f = bhf % F;
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const int out_sel = warp >> 3, rt = warp & 7;
+  const long Nd = (long)F * S;             // tokens per (b,h)
+  const long kbase = (long)bh * D * Nd;    // k/v base for this bh
+
+  extern __shared__ char sm[];
+  bf16* Ksm  = reinterpret_cast<bf16*>(sm);   // [ACHUNK,D]
+  bf16* bKsm = Ksm + ACHUNK * D;              // [ACHUNK,D]
+  bf16* bVsm = bKsm + ACHUNK * D;             // [ACHUNK,D]
+
+  wmma::fragment<wmma::accumulator, WM, WM, WM, float> acc[NCT];
+  #pragma unroll
+  for (int ct = 0; ct < NCT; ++ct) wmma::fill_fragment(acc[ct], 0.f);
+
+  const float* beta_bhf = beta + (long)bhf * S;
+  const int n_base = f * S;
+
+  for (int s0 = 0; s0 < S; s0 += ACHUNK) {
+    for (int idx = tid; idx < ACHUNK * D; idx += ATH_KV) {
+      const int sl = idx >> 7, d = idx & 127, s = s0 + sl;
+      float kk = 0.f, bv = 0.f, bk = 0.f;
+      if (s < S) {
+        const long off = kbase + (long)d * Nd + (n_base + s);
+        const float be = beta_bhf[s];
+        kk = k[off]; bk = be * kk; bv = be * v[off];
+      }
+      Ksm[idx] = __float2bfloat16(kk);
+      bKsm[idx] = __float2bfloat16(bk);
+      bVsm[idx] = __float2bfloat16(bv);
+    }
+    __syncthreads();
+    const bf16* bsrc = out_sel ? bVsm : bKsm;
+    #pragma unroll
+    for (int ks = 0; ks < ASUB; ++ks) {
+      wmma::fragment<wmma::matrix_a, WM, WM, WM, bf16, wmma::col_major> a_frag;
+      wmma::load_matrix_sync(a_frag, Ksm + ks * WM * D + rt * WM, D);
+      #pragma unroll
+      for (int ct = 0; ct < NCT; ++ct) {
+        wmma::fragment<wmma::matrix_b, WM, WM, WM, bf16, wmma::row_major> bfr;
+        wmma::load_matrix_sync(bfr, bsrc + ks * WM * D + ct * WM, D);
+        wmma::mma_sync(acc[ct], a_frag, bfr, acc[ct]);
+      }
+    }
+    __syncthreads();
+  }
+
+  bf16* dst = (out_sel ? A : I_P_kv) + (long)bhf * D * D;
+  __shared__ float st[AW_KV][WM * WM];
+  #pragma unroll
+  for (int ct = 0; ct < NCT; ++ct) {
+    wmma::store_matrix_sync(st[warp], acc[ct], WM, wmma::mem_row_major);
+    __syncwarp();
+    for (int i = lane; i < WM * WM; i += 32) {
+      const int d = rt * WM + (i >> 4), dp = ct * WM + (i & 15);
+      float val = st[warp][i];
+      if (out_sel == 0) val = (d == dp ? 1.f : 0.f) - val;
+      dst[(long)d * D + dp] = __float2bfloat16(val);
+    }
+    __syncwarp();
+  }
+}
+
+// num = Q @ M_hist, write transposed fp32 to [B,H,D,N]. grid (BH*F, S_TILES).
+__global__ void cam_phase_c_kernel(
+    const float* __restrict__ q,   // [B,H,D,N]
+    const bf16*  __restrict__ M,   // [BH,F,D,D] bf16
+    float* __restrict__ out,       // [B,H,D,N]
+    int B, int H, int F, int S, int S_TILES) {
+  const int bhf = blockIdx.x, s_tile = blockIdx.y, f = bhf % F;
+  const int bh = bhf / F;
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const int s0 = s_tile * ROWS;
+  const long Nd = (long)F * S;
+  const long qbase = (long)bh * D * Nd;
+  const int n_base = f * S;
+
+  extern __shared__ char smem_raw[];
+  bf16* Qsm = reinterpret_cast<bf16*>(smem_raw);   // [ROWS,D]
+  const bf16* M_f = M + (long)bhf * D * D;
+
+  for (int idx = tid; idx < ROWS * D; idx += THREADS) {
+    const int r = idx >> 7, d = idx & 127, s = s0 + r;
+    float qv = 0.f;
+    if (s < S) qv = q[qbase + (long)d * Nd + (n_base + s)];
+    Qsm[idx] = __float2bfloat16(qv);
+  }
+  __syncthreads();
+
+  const int ct = warp;
+  __shared__ float tile_smem[WARPS][WM * WM];
+  wmma::fragment<wmma::accumulator, WM, WM, WM, float> acc[ROWS / WM];
+  #pragma unroll
+  for (int rt = 0; rt < ROWS / WM; ++rt) wmma::fill_fragment(acc[rt], 0.f);
+  #pragma unroll
+  for (int kt = 0; kt < KT; ++kt) {
+    wmma::fragment<wmma::matrix_b, WM, WM, WM, bf16, wmma::row_major> b_frag;
+    wmma::load_matrix_sync(b_frag, M_f + (kt * WM) * D + ct * WM, D);
+    #pragma unroll
+    for (int rt = 0; rt < ROWS / WM; ++rt) {
+      wmma::fragment<wmma::matrix_a, WM, WM, WM, bf16, wmma::row_major> a_frag;
+      wmma::load_matrix_sync(a_frag, Qsm + (rt * WM) * D + kt * WM, D);
+      wmma::mma_sync(acc[rt], a_frag, b_frag, acc[rt]);
+    }
+  }
+  #pragma unroll
+  for (int rt = 0; rt < ROWS / WM; ++rt) {
+    wmma::store_matrix_sync(tile_smem[warp], acc[rt], WM, wmma::mem_row_major);
+    __syncwarp();
+    for (int i = lane; i < WM * WM; i += 32) {
+      const int s = s0 + rt * WM + (i >> 4);
+      if (s < S) {
+        const int j = ct * WM + (i & 15);
+        out[qbase + (long)j * Nd + (n_base + s)] = tile_smem[warp][i];
+      }
+    }
+    __syncwarp();
+  }
+}
+
+// cam Phase B: serial F scan, fwd+rev combined -> bf16 M_hist directly (no fp32
+// roundtrip). skip_z. M state kept bf16 in smem. grid (BH,), 8 warps, warp w
+// owns output row-tile w. M = g*(I-P_kv)@M + A.
+__global__ void cam_phase_b_kernel(
+    const bf16* __restrict__ I_P_kv,  // [BH,F,D,D]
+    const bf16* __restrict__ A,       // [BH,F,D,D]
+    const float* __restrict__ decay,  // [BH,F]
+    bf16* __restrict__ M_hist,        // [BH,F,D,D]
+    int BH, int F) {
+  const int bh = blockIdx.x;
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const int rt = warp;                      // row-tile (8 warps -> 8 row-tiles)
+  extern __shared__ char smem_raw[];
+  bf16* Mbf = reinterpret_cast<bf16*>(smem_raw);  // [D,D] running state
+  __shared__ float st[WARPS][WM * WM];
+
+  const bf16* IP_bh = I_P_kv + (long)bh * F * D * D;
+  const bf16* A_bh  = A + (long)bh * F * D * D;
+  const float* g_bh = decay + (long)bh * F;
+
+  // helper macro replaced by inline: compute M_new for frame f into st/Mbf
+  #define CAM_B_FRAME(f, WRITE_ADD, dstframe)                                   \
+  {                                                                             \
+    const bf16* IP_f = IP_bh + (long)(f) * D * D;                               \
+    const bf16* A_f  = A_bh + (long)(f) * D * D;                                \
+    const float g = g_bh[(f)];                                                  \
+    wmma::fragment<wmma::accumulator, WM, WM, WM, float> acc[NCT];              \
+    _Pragma("unroll") for (int ct = 0; ct < NCT; ++ct) wmma::fill_fragment(acc[ct], 0.f); \
+    _Pragma("unroll") for (int kt = 0; kt < KT; ++kt) {                         \
+      wmma::fragment<wmma::matrix_a, WM, WM, WM, bf16, wmma::row_major> a_frag;  \
+      wmma::load_matrix_sync(a_frag, IP_f + (long)(rt * WM) * D + kt * WM, D);   \
+      _Pragma("unroll") for (int ct = 0; ct < NCT; ++ct) {                       \
+        wmma::fragment<wmma::matrix_b, WM, WM, WM, bf16, wmma::row_major> b_frag; \
+        wmma::load_matrix_sync(b_frag, Mbf + (long)(kt * WM) * D + ct * WM, D);   \
+        wmma::mma_sync(acc[ct], a_frag, b_frag, acc[ct]);                         \
+      }                                                                          \
+    }                                                                            \
+    __syncthreads(); /* all warps done reading Mbf before overwrite */          \
+    _Pragma("unroll") for (int ct = 0; ct < NCT; ++ct) {                         \
+      wmma::store_matrix_sync(st[warp], acc[ct], WM, wmma::mem_row_major);        \
+      __syncwarp();                                                              \
+      for (int i = lane; i < WM * WM; i += 32) {                                 \
+        const int d = rt * WM + (i >> 4), dp = ct * WM + (i & 15);               \
+        float mnew = g * st[warp][i] + __bfloat162float(A_f[(long)d * D + dp]);   \
+        Mbf[(long)d * D + dp] = __float2bfloat16(mnew);                          \
+        bf16* hp = M_hist + ((long)bh * F + (dstframe)) * D * D + (long)d * D + dp; \
+        if (WRITE_ADD) *hp = __float2bfloat16(__bfloat162float(*hp) + mnew);      \
+        else *hp = __float2bfloat16(mnew);                                       \
+      }                                                                          \
+      __syncwarp();                                                              \
+    }                                                                            \
+    __syncthreads();                                                             \
+  }
+
+  // forward
+  for (int i = tid; i < D * D; i += THREADS) Mbf[i] = __float2bfloat16(0.f);
+  __syncthreads();
+  for (int f = 0; f < F; ++f) CAM_B_FRAME(f, false, f);
+  // reverse (combined): for f_src=F-1..1, add into M_hist[f_src-1]
+  for (int i = tid; i < D * D; i += THREADS) Mbf[i] = __float2bfloat16(0.f);
+  __syncthreads();
+  for (int f = F - 1; f >= 1; --f) CAM_B_FRAME(f, true, f - 1);
+  #undef CAM_B_FRAME
+}
+
+}  // namespace
+
+void cam_phase_b(torch::Tensor I_P_kv, torch::Tensor A, torch::Tensor decay,
+                 torch::Tensor M_hist, int F) {
+  const int BH = I_P_kv.size(0);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  size_t smem = sizeof(bf16) * D * D;
+  cam_phase_b_kernel<<<BH, THREADS, smem, stream>>>(
+      reinterpret_cast<const bf16*>(I_P_kv.data_ptr()),
+      reinterpret_cast<const bf16*>(A.data_ptr()),
+      decay.data_ptr<float>(), reinterpret_cast<bf16*>(M_hist.data_ptr()), BH, F);
+}
+
+void cam_phase_a_kv(torch::Tensor k, torch::Tensor v, torch::Tensor beta,
+                    torch::Tensor I_P_kv, torch::Tensor A, int F, int S) {
+  const int B = k.size(0), H = k.size(1), BH = B * H;
+  auto stream = at::cuda::getCurrentCUDAStream();
+  size_t smem = sizeof(bf16) * (3 * ACHUNK * D);
+  cam_phase_a_kv_kernel<<<BH * F, ATH_KV, smem, stream>>>(
+      k.data_ptr<float>(), v.data_ptr<float>(), beta.data_ptr<float>(),
+      reinterpret_cast<bf16*>(I_P_kv.data_ptr()), reinterpret_cast<bf16*>(A.data_ptr()),
+      B, H, F, S);
+}
+
+void cam_phase_c(torch::Tensor q, torch::Tensor M, torch::Tensor out, int F, int S) {
+  const int B = q.size(0), H = q.size(1), BH = B * H;
+  const int S_TILES = (S + ROWS - 1) / ROWS;
+  auto stream = at::cuda::getCurrentCUDAStream();
+  size_t smem = sizeof(bf16) * (ROWS * D);
+  dim3 grid(BH * F, S_TILES);
+  cam_phase_c_kernel<<<grid, THREADS, smem, stream>>>(
+      q.data_ptr<float>(), reinterpret_cast<const bf16*>(M.data_ptr()),
+      out.data_ptr<float>(), B, H, F, S, S_TILES);
+}
+
+void phase_a_kv(torch::Tensor qkv, torch::Tensor beta, torch::Tensor k_inv_rms,
+                torch::Tensor k_norm_w, torch::Tensor rope_cos, torch::Tensor rope_sin,
+                torch::Tensor I_P_kv, torch::Tensor A, int F, int S, double k_scale) {
+  const int B = qkv.size(0), H = qkv.size(3), BH = I_P_kv.size(0);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  size_t smem = sizeof(float) * (ACHUNK * D + D) + sizeof(bf16) * (3 * ACHUNK * D);
+  static bool s_kv = false;
+  if (!s_kv) { cudaFuncSetAttribute(phase_a_kv_kernel,
+      cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem); s_kv = true; }
+  phase_a_kv_kernel<<<BH * F, ATH_KV, smem, stream>>>(
+      reinterpret_cast<const bf16*>(qkv.data_ptr()),
+      qkv.stride(0), qkv.stride(1), qkv.stride(2), qkv.stride(3), qkv.stride(4),
+      beta.data_ptr<float>(), k_inv_rms.data_ptr<float>(), k_norm_w.data_ptr<float>(),
+      rope_cos.data_ptr<float>(), rope_sin.data_ptr<float>(),
+      reinterpret_cast<bf16*>(I_P_kv.data_ptr()), reinterpret_cast<bf16*>(A.data_ptr()),
+      B, H, F, S, (float)k_scale);
+}
+
+void phase_a_z(torch::Tensor qkv, torch::Tensor beta, torch::Tensor k_inv_rms,
+               torch::Tensor k_norm_w, torch::Tensor I_P_z, torch::Tensor Bz,
+               int F, int S, double k_scale) {
+  const int B = qkv.size(0), H = qkv.size(3), BH = I_P_z.size(0);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  size_t smem = sizeof(bf16) * (2 * ACHUNK * D) + sizeof(float) * (2 * D);
+  phase_a_z_kernel<<<BH * F, THREADS, smem, stream>>>(
+      reinterpret_cast<const bf16*>(qkv.data_ptr()),
+      qkv.stride(0), qkv.stride(1), qkv.stride(2), qkv.stride(3), qkv.stride(4),
+      beta.data_ptr<float>(), k_inv_rms.data_ptr<float>(), k_norm_w.data_ptr<float>(),
+      reinterpret_cast<bf16*>(I_P_z.data_ptr()), Bz.data_ptr<float>(),
+      B, H, F, S, (float)k_scale);
+}
+
+void phase_c_fused(torch::Tensor qkv, torch::Tensor q_inv_rms, torch::Tensor q_norm_w,
+                   torch::Tensor rope_cos, torch::Tensor rope_sin,
+                   torch::Tensor M, torch::Tensor z, torch::Tensor out,
+                   int F, int S, double eps) {
+  const int B = qkv.size(0);
+  const int H = qkv.size(3);
+  const int BH = M.size(0);
+  const int S_TILES = (S + ROWS - 1) / ROWS;
+  auto stream = at::cuda::getCurrentCUDAStream();
+  dim3 grid(BH * F, S_TILES);
+  size_t smem = sizeof(float) * (D + D + ROWS) + sizeof(bf16) * (ROWS * D);
+  phase_c_fused_kernel<<<grid, THREADS, smem, stream>>>(
+      reinterpret_cast<const bf16*>(qkv.data_ptr()),
+      qkv.stride(0), qkv.stride(1), qkv.stride(2), qkv.stride(3), qkv.stride(4),
+      q_inv_rms.data_ptr<float>(), q_norm_w.data_ptr<float>(),
+      rope_cos.data_ptr<float>(), rope_sin.data_ptr<float>(),
+      reinterpret_cast<const bf16*>(M.data_ptr()), z.data_ptr<float>(),
+      reinterpret_cast<bf16*>(out.data_ptr()),
+      B, H, F, S, S_TILES, (float)eps);
+}
+"""
+
+CPP_SRC = r"""
+#include <torch/extension.h>
+void phase_c_fused(torch::Tensor qkv, torch::Tensor q_inv_rms, torch::Tensor q_norm_w,
+                   torch::Tensor rope_cos, torch::Tensor rope_sin,
+                   torch::Tensor M, torch::Tensor z, torch::Tensor out,
+                   int F, int S, double eps);
+void phase_a_kv(torch::Tensor qkv, torch::Tensor beta, torch::Tensor k_inv_rms,
+                torch::Tensor k_norm_w, torch::Tensor rope_cos, torch::Tensor rope_sin,
+                torch::Tensor I_P_kv, torch::Tensor A, int F, int S, double k_scale);
+void phase_a_z(torch::Tensor qkv, torch::Tensor beta, torch::Tensor k_inv_rms,
+               torch::Tensor k_norm_w, torch::Tensor I_P_z, torch::Tensor Bz,
+               int F, int S, double k_scale);
+void cam_phase_a_kv(torch::Tensor k, torch::Tensor v, torch::Tensor beta,
+                    torch::Tensor I_P_kv, torch::Tensor A, int F, int S);
+void cam_phase_b(torch::Tensor I_P_kv, torch::Tensor A, torch::Tensor decay,
+                 torch::Tensor M_hist, int F);
+void cam_phase_c(torch::Tensor q, torch::Tensor M, torch::Tensor out, int F, int S);
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("phase_c_fused", &phase_c_fused);
+  m.def("phase_a_kv", &phase_a_kv);
+  m.def("phase_a_z", &phase_a_z);
+  m.def("cam_phase_a_kv", &cam_phase_a_kv);
+  m.def("cam_phase_b", &cam_phase_b);
+  m.def("cam_phase_c", &cam_phase_c);
+}
+"""
+
+
+def _system_cuda_home():
+    """The svideo conda nvcc ships without headers (cuda_runtime.h, nv/target,
+    crt/host_config.h all missing/fragmented). A complete CUDA 12.9 toolkit
+    lives at /usr/local/cuda-12.9 — point the build at it."""
+    for c in ("/usr/local/cuda-12.9", "/usr/local/cuda", "/usr/local/cuda-12"):
+        if (os.path.isfile(os.path.join(c, "include", "cuda_runtime.h"))
+                and os.path.isfile(os.path.join(c, "include", "nv", "target"))
+                and os.path.isfile(os.path.join(c, "bin", "nvcc"))):
+            return c
+    return None
+
+
+def build(name="cw_cuda_ext_v1", extra_cuda=None):
+    global _EXT
+    if _EXT is not None:
+        return _EXT
+    os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0")
+    import torch.utils.cpp_extension as C
+    home = _system_cuda_home()
+    incs = []
+    if home:
+        os.environ["CUDA_HOME"] = home
+        os.environ["PATH"] = os.path.join(home, "bin") + os.pathsep + os.environ.get("PATH", "")
+        C.CUDA_HOME = home  # override torch's import-time cached value
+        incs = [os.path.join(home, "include")]
+    _EXT = load_inline(
+        name=name,
+        cpp_sources=CPP_SRC,
+        cuda_sources=CUDA_SRC,
+        extra_cuda_cflags=["-O3", "-lineinfo", "-Xptxas=-v"] + (extra_cuda or []),
+        extra_include_paths=incs,
+        with_cuda=True,
+        verbose=True,
+    )
+    return _EXT
+
+
+def cuda_phase_c_fused(inp, M_hist, z_hist, eps=1e-6):
+    ext = build()
+    qkv = inp["qkv"]
+    B, N, _, H, Dd = qkv.shape
+    out = torch.empty(B, N, H, Dd, device=qkv.device, dtype=qkv.dtype)
+    M_bf = M_hist.to(torch.bfloat16).contiguous()
+    ext.phase_c_fused(
+        qkv.contiguous(), inp["q_inv_rms"].contiguous(), inp["q_norm_w"].contiguous(),
+        inp["rope_cos"].contiguous(), inp["rope_sin"].contiguous(),
+        M_bf, z_hist.contiguous(), out, inp["F"], inp["S"], eps,
+    )
+    return out
+
+
+def cuda_phase_a(inp, k_scale=1.0):
+    """CUDA Phase A -> (I_P_kv, A, I_P_z, B_z), shapes/dtypes matching Triton."""
+    ext = build()
+    qkv = inp["qkv"].contiguous()
+    B, N, _, H, Dd = qkv.shape
+    BH, F, S = B * H, inp["F"], inp["S"]
+    dev = qkv.device
+    BD = 1 << (Dd - 1).bit_length()  # next pow2 (==128 for Dd<=128)
+    I_P_kv = torch.empty(BH, F, BD, BD, device=dev, dtype=torch.bfloat16)
+    A = torch.empty(BH, F, BD, BD, device=dev, dtype=torch.bfloat16)
+    I_P_z = torch.empty(BH, F, BD, BD, device=dev, dtype=torch.bfloat16)
+    B_z = torch.empty(BH, F, BD, device=dev, dtype=torch.float32)
+    beta = inp["beta"].contiguous().float()
+    kir = inp["k_inv_rms"].contiguous().float()
+    knw = inp["k_norm_w"].contiguous().float()
+    rc, rs = inp["rope_cos"].contiguous(), inp["rope_sin"].contiguous()
+    ext.phase_a_kv(qkv, beta, kir, knw, rc, rs, I_P_kv, A, F, S, k_scale)
+    ext.phase_a_z(qkv, beta, kir, knw, I_P_z, B_z, F, S, k_scale)
+    return I_P_kv, A, I_P_z, B_z
+
+
+def cam_scan_bidi_chunkwise_cuda(q, k, v, beta, decay, *, dot_precision=None):
+    """Drop-in for fused_gdn_chunkwise.cam_scan_bidi_chunkwise.
+
+    CUDA fast path when head_dim==128 & fp32 contiguous inputs (the deployed
+    sana_wm config: attention_head_dim=128). Falls back to the Triton entry
+    otherwise so this is always safe to substitute.
+    """
+    B, H, D, N = q.shape
+    F = beta.shape[2]
+    if (D == 128 and q.dtype == torch.float32 and N % F == 0
+            and q.is_contiguous() and k.is_contiguous() and v.is_contiguous()):
+        return run_cuda_cam(q, k, v, beta, decay)
+    from diffusion.model.ops.fused_gdn_chunkwise import cam_scan_bidi_chunkwise
+    return cam_scan_bidi_chunkwise(q, k, v, beta, decay, dot_precision=dot_precision)
+
+
+_CAM_BUFS = {}
+# Triton phase_b (fp32 state) is fast (0.04ms) & accurate. The CUDA cam_phase_b
+# kept bf16 M-state across frames -> drift (max_rel 0.14) and was slow (serial,
+# BH CTAs) -> disabled by default. fp32-state CUDA phase B is future work.
+_CAM_PHASE_B = os.environ.get("CAM_PHASE_B", "triton")  # "triton" (default) or "cuda"
+
+
+def run_cuda_cam(q, k, v, beta, decay, reuse_buffers=True):
+    """CUDA cam path: reads q/k/v [B,H,D,N] directly, writes fp32 [B,H,D,N]
+    directly (no packing, no transpose). Phase B via Triton (skip_z).
+
+    reuse_buffers=True caches the I_P_kv/A/M_bf/out scratch by shape — a
+    streaming deployment reuses these every step, so per-call torch.empty/.to
+    (which otherwise hits cudaMalloc sync under memory pressure) is amortised."""
+    ext = build()
+    B, H, D, N = q.shape
+    BH, F = B * H, beta.shape[2]
+    S = N // F
+    dev = q.device
+    BD = 1 << (D - 1).bit_length()
+    k = k.contiguous(); v = v.contiguous(); q = q.contiguous()
+    beta_f = beta.contiguous().float()
+    key = (B, H, D, N, F, dev)
+    buf = _CAM_BUFS.get(key) if reuse_buffers else None
+    if buf is None:
+        buf = dict(
+            I_P_kv=torch.empty(BH, F, BD, BD, device=dev, dtype=torch.bfloat16),
+            A=torch.empty(BH, F, BD, BD, device=dev, dtype=torch.bfloat16),
+            M_bf=torch.empty(BH, F, BD, BD, device=dev, dtype=torch.bfloat16),
+            out=torch.empty(B, H, D, N, device=dev, dtype=torch.float32),
+        )
+        if reuse_buffers:
+            _CAM_BUFS[key] = buf
+    I_P_kv, A, M_bf, out = buf["I_P_kv"], buf["A"], buf["M_bf"], buf["out"]
+    ext.cam_phase_a_kv(k, v, beta_f, I_P_kv, A, F, S)
+    if _CAM_PHASE_B == "cuda":
+        ext.cam_phase_b(I_P_kv, A, decay.contiguous().float(), M_bf, F)
+    else:
+        dummy = torch.empty(1, device=dev, dtype=torch.float32)
+        M_hist, _, _, _ = phase_b_triton(
+            I_P_kv, A, dummy, dummy, decay.contiguous(), F=F, dot_precision=0,
+            direction=0, combined_history=True, skip_z=True)
+        M_bf.copy_(M_hist)
+    ext.cam_phase_c(q, M_bf, out, F, S)
+    return out
+
+
+def run_cuda(inp, mode="ac", dot_precision=0, eps=1e-6):
+    qkv = inp["qkv"]
+    F, S = inp["F"], inp["S"]
+    if mode in ("ac", "abc_a"):
+        I_P_kv, A, I_P_z, B_z = cuda_phase_a(inp)
+    else:
+        I_P_kv, A, I_P_z, B_z = phase_a(
+            qkv, inp["beta"], inp["q_inv_rms"], inp["k_inv_rms"], inp["q_norm_w"],
+            inp["k_norm_w"], inp["rope_cos"], inp["rope_sin"], F=F, S=S,
+            dot_precision=dot_precision)
+    M_hist, z_hist, _, _ = phase_b_triton(
+        I_P_kv, A, I_P_z, B_z, inp["decay"], F=F, dot_precision=dot_precision,
+        direction=0, combined_history=True)
+    return cuda_phase_c_fused(inp, M_hist, z_hist, eps=eps)
