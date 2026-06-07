@@ -402,15 +402,19 @@ __global__ __launch_bounds__(ATH_KV) void cam_phase_a_kv_kernel(
   const int n_base = f * S;
 
   for (int s0 = 0; s0 < S; s0 += ACHUNK) {
-    for (int idx = tid; idx < ACHUNK * D; idx += ATH_KV) {
-      const int sl = idx >> 7, d = idx & 127, s = s0 + sl;
+    // stage K/V D-MAJOR [d][sl]: read along N (contiguous, coalesced — k/v are
+    // [B,H,D,N]) and write contiguously. a_frag = K is then row_major; the wmma
+    // transpose moves to the b-operand (col_major). Avoids the uncoalesced
+    // strided global loads that were the L1TEX bottleneck (ncu).
+    for (int idx = tid; idx < D * ACHUNK; idx += ATH_KV) {
+      const int d = idx / ACHUNK, sl = idx - d * ACHUNK, s = s0 + sl;
       float kk = 0.f, bv = 0.f, bk = 0.f;
       if (s < S) {
         const long off = kbase + (long)d * Nd + (n_base + s);
         const float be = beta_bhf[s];
         kk = k[off]; bk = be * kk; bv = be * v[off];
       }
-      Ksm[idx] = __float2bfloat16(kk);
+      Ksm[idx]  = __float2bfloat16(kk);   // Ksm[d*ACHUNK + sl]
       bKsm[idx] = __float2bfloat16(bk);
       bVsm[idx] = __float2bfloat16(bv);
     }
@@ -418,12 +422,14 @@ __global__ __launch_bounds__(ATH_KV) void cam_phase_a_kv_kernel(
     const bf16* bsrc = out_sel ? bVsm : bKsm;
     #pragma unroll
     for (int ks = 0; ks < ASUB; ++ks) {
-      wmma::fragment<wmma::matrix_a, WM, WM, WM, bf16, wmma::col_major> a_frag;
-      wmma::load_matrix_sync(a_frag, Ksm + ks * WM * D + rt * WM, D);
+      // a = K[rt-rows, ks-cols] row_major (d-major smem, ldm=ACHUNK)
+      wmma::fragment<wmma::matrix_a, WM, WM, WM, bf16, wmma::row_major> a_frag;
+      wmma::load_matrix_sync(a_frag, Ksm + rt * WM * ACHUNK + ks * WM, ACHUNK);
       #pragma unroll
       for (int ct = 0; ct < NCT; ++ct) {
-        wmma::fragment<wmma::matrix_b, WM, WM, WM, bf16, wmma::row_major> bfr;
-        wmma::load_matrix_sync(bfr, bsrc + ks * WM * D + ct * WM, D);
+        // b = (betaK)^T : col_major from d-major betaK, ldm=ACHUNK
+        wmma::fragment<wmma::matrix_b, WM, WM, WM, bf16, wmma::col_major> bfr;
+        wmma::load_matrix_sync(bfr, bsrc + ct * WM * ACHUNK + ks * WM, ACHUNK);
         wmma::mma_sync(acc[ct], a_frag, bfr, acc[ct]);
       }
     }
@@ -461,14 +467,16 @@ __global__ void cam_phase_c_kernel(
   const int n_base = f * S;
 
   extern __shared__ char smem_raw[];
-  bf16* Qsm = reinterpret_cast<bf16*>(smem_raw);   // [ROWS,D]
+  bf16* Qsm = reinterpret_cast<bf16*>(smem_raw);   // [D, ROWS] d-major
   const bf16* M_f = M + (long)bhf * D * D;
 
-  for (int idx = tid; idx < ROWS * D; idx += THREADS) {
-    const int r = idx >> 7, d = idx & 127, s = s0 + r;
+  // stage Q D-MAJOR [i][r]: read q[i, n] along N (coalesced; q is [B,H,D,N]).
+  // a_frag = Q is then col_major (a[s,i]=Q[i,s]); b_frag = M stays row_major.
+  for (int idx = tid; idx < D * ROWS; idx += THREADS) {
+    const int i = idx / ROWS, r = idx - i * ROWS, s = s0 + r;
     float qv = 0.f;
-    if (s < S) qv = q[qbase + (long)d * Nd + (n_base + s)];
-    Qsm[idx] = __float2bfloat16(qv);
+    if (s < S) qv = q[qbase + (long)i * Nd + (n_base + s)];
+    Qsm[idx] = __float2bfloat16(qv);             // Qsm[i*ROWS + r]
   }
   __syncthreads();
 
@@ -483,8 +491,8 @@ __global__ void cam_phase_c_kernel(
     wmma::load_matrix_sync(b_frag, M_f + (kt * WM) * D + ct * WM, D);
     #pragma unroll
     for (int rt = 0; rt < ROWS / WM; ++rt) {
-      wmma::fragment<wmma::matrix_a, WM, WM, WM, bf16, wmma::row_major> a_frag;
-      wmma::load_matrix_sync(a_frag, Qsm + (rt * WM) * D + kt * WM, D);
+      wmma::fragment<wmma::matrix_a, WM, WM, WM, bf16, wmma::col_major> a_frag;
+      wmma::load_matrix_sync(a_frag, Qsm + (kt * WM) * ROWS + rt * WM, ROWS);
       wmma::mma_sync(acc[rt], a_frag, b_frag, acc[rt]);
     }
   }
