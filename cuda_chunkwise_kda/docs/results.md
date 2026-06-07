@@ -14,10 +14,17 @@ Key insight: the Python-side `num/(den+eps)` divide (fp32, 26M elts, permute) is
 | Triton (all) | 0.837 ms | 1.00× | baseline |
 | Triton A/B + **CUDA C+divide fused** | **0.669 ms** | **1.25×** | divide fused into Phase C (regs), max_rel 1.39e-2 |
 
-CUDA Phase A (kv+z): bit-exact vs Triton (max_abs=0) but 0.97 ms vs Triton's
-well-tuned 0.337 ms — Triton's prep+GEMM is near-optimal here, so Phase A stays
-Triton in the perf config (`--cmode c`). Full-CUDA A+C (`--cmode ac`) is correct
-but slower (Phase A dominates). CUDA Phase A exists for full-rewrite completeness.
+CUDA Phase A (kv+z): bit-exact vs Triton (max_abs=0). Optimized kv
+**0.524 → 0.356 ms (~32%)** via single-pass prep (recompute the RoPE-pair `d^1`
+from global instead of a 2nd pass+sync), `cp.async` double-buffered K/V prefetch,
+hoisted per-row constants (invrms/beta) out of the d-loop, and float4-vectorized
+cos/sin/normw loads. Still ~2× Triton's autotuned GEMM for this small-output
+(128×128) / large-K (920) shape — the residual gap is Triton's codegen maturity
+(reg alloc, scheduling); precise diagnosis is blocked because ncu has no
+perf-counter permission on this shared box. Since the GEMM has no *structural*
+CUDA advantage, the full-path perf config keeps Triton's Phase A (`--cmode c`).
+(A 32-warp/4-frag variant raised occupancy but hurt the cam path's L1-cached
+strided loads, so 16 warps/8 frags is used.)
 
 ## Cam path (`cam_scan_bidi_chunkwise`) — the LIVE model entry
 Identity norm/RoPE, skip_relu, skip_z (num-only), output transposed to [B,H,D,N].

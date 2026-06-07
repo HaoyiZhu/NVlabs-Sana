@@ -21,6 +21,7 @@ CUDA_SRC = r"""
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <cuda_pipeline.h>
 #include <mma.h>
 
 using namespace nvcuda;
@@ -154,8 +155,8 @@ __global__ void phase_c_fused_kernel(
 // Per (bh,f): I_P_kv[D,D]=I-K_rot^T diag(b) K_rot, A[D,D]=K_rot^T diag(b) V.
 // grid (BH*F,), 16 warps (512 thr). warp w owns (output=w>>3, row-tile=w&7) and
 // its 8 col-tiles -> 8 acc frags/warp (avoids register spills). Krot prep shared.
-constexpr int AW_KV = 16;
-constexpr int ATH_KV = AW_KV * 32;
+constexpr int AW_KV = 16;          // warp w owns one output's row-tile (8 frags)
+constexpr int ATH_KV = AW_KV * 32; // 512 threads
 constexpr int ACHUNK = 32;            // S-rows staged per sync cycle
 constexpr int ASUB = ACHUNK / WM;     // wmma k-subtiles per chunk
 __global__ __launch_bounds__(ATH_KV) void phase_a_kv_kernel(
@@ -173,12 +174,17 @@ __global__ __launch_bounds__(ATH_KV) void phase_a_kv_kernel(
   const int out_sel = warp >> 3;   // 0=P_kv, 1=A
   const int rt = warp & 7;         // row-tile (d in [16*rt, 16*rt+16))
 
+  // Assumes contiguous packed qkv: sd==1, so K/V rows are contiguous in d
+  // (16-byte cp.async friendly). sn is the per-token stride.
   extern __shared__ char sm[];
-  float* K_t  = reinterpret_cast<float*>(sm);          // [ACHUNK,D] fp32
-  float* knw  = K_t + ACHUNK * D;                       // [D]
+  bf16*  bufK = reinterpret_cast<bf16*>(sm);            // [2][ACHUNK,D] raw K
+  bf16*  bufV = bufK + 2 * ACHUNK * D;                  // [2][ACHUNK,D] raw V
+  float* knw  = reinterpret_cast<float*>(bufV + 2 * ACHUNK * D); // [D]
   bf16*  Krot = reinterpret_cast<bf16*>(knw + D);       // [ACHUNK,D]
   bf16*  bKrot= Krot + ACHUNK * D;                      // [ACHUNK,D]
-  bf16*  bV   = bKrot + ACHUNK * D;                      // [ACHUNK,D]
+  bf16*  bV   = bKrot + ACHUNK * D;                     // [ACHUNK,D]
+  float* irms_s = reinterpret_cast<float*>(bV + ACHUNK * D); // [ACHUNK]
+  float* beta_s = irms_s + ACHUNK;                      // [ACHUNK]
 
   for (int i = tid; i < D; i += ATH_KV) knw[i] = k_norm_w[h * D + i];
 
@@ -190,32 +196,73 @@ __global__ __launch_bounds__(ATH_KV) void phase_a_kv_kernel(
   const bf16* qkv_v = qkv + (long)b * sb + 2 * s3 + (long)h * sh;
   const float* beta_bhf = beta + (long)bh * N + (long)f * S;
   const int n_base = f * S;
-  __syncthreads();
+  const int NCH = (S + ACHUNK - 1) / ACHUNK;
+  const int VEC = 8;                       // 8 bf16 = 16 bytes per cp.async
+  const int COPIES = (ACHUNK * D) / VEC;   // 16-byte copies per chunk per tensor
 
-  for (int s0 = 0; s0 < S; s0 += ACHUNK) {
-    for (int idx = tid; idx < ACHUNK * D; idx += ATH_KV) {
-      const int sl = idx >> 7, d = idx & 127, s = s0 + sl;
-      float kv = 0.f;
-      if (s < S) {
-        const int n = n_base + s;
-        float kn = __bfloat162float(qkv_k[(long)n * sn + (long)d * sd]) * k_inv_rms[b * N + n] * knw[d];
-        kv = (kn > 0.f ? kn : 0.f) * k_scale;
-      }
-      K_t[idx] = kv;
+  // cp.async stage raw K,V for chunk c into double-buffer slot c%2.
+  #define STAGE(c) {                                                            \
+    const int _s0 = (c) * ACHUNK; const int _slot = ((c) & 1) * ACHUNK * D;     \
+    for (int t = tid; t < COPIES; t += ATH_KV) {                               \
+      const int _sl = t / (D / VEC), _d = (t % (D / VEC)) * VEC, _s = _s0 + _sl; \
+      if (_s < S) {                                                            \
+        const long _ko = (long)(n_base + _s) * sn + _d;                        \
+        __pipeline_memcpy_async(&bufK[_slot + _sl * D + _d], &qkv_k[_ko], 16);  \
+        __pipeline_memcpy_async(&bufV[_slot + _sl * D + _d], &qkv_v[_ko], 16);  \
+      }                                                                        \
+    }                                                                          \
+    __pipeline_commit();                                                       \
+  }
+
+  STAGE(0);
+  __syncthreads();
+  for (int c = 0; c < NCH; ++c) {
+    if (c + 1 < NCH) STAGE(c + 1);
+    __pipeline_wait_prior(c + 1 < NCH ? 1 : 0);
+    const int s0 = c * ACHUNK;
+    // hoist per-row constants (invrms, beta) once -> avoid 128x redundant loads.
+    for (int i = tid; i < ACHUNK; i += ATH_KV) {
+      const int s = s0 + i;
+      irms_s[i] = (s < S) ? k_inv_rms[b * N + n_base + s] : 0.f;
+      beta_s[i] = (s < S) ? beta_bhf[s] : 0.f;
     }
     __syncthreads();
-    for (int idx = tid; idx < ACHUNK * D; idx += ATH_KV) {
-      const int sl = idx >> 7, d = idx & 127, s = s0 + sl;
-      float krot = 0.f;
+    const bf16* Kb = bufK + (c & 1) * ACHUNK * D;
+    const bf16* Vb = bufV + (c & 1) * ACHUNK * D;
+    // vectorized prep: each thread does a 4-wide d-block (d4..d4+3). RoPE pair
+    // d^1 stays within the block, so one float4 cos/sin/knw load covers all 4.
+    for (int t = tid; t < ACHUNK * (D / 4); t += ATH_KV) {
+      const int sl = t / (D / 4), d4 = (t % (D / 4)) * 4, s = s0 + sl;
+      float kr[4] = {0, 0, 0, 0}, bvv[4] = {0, 0, 0, 0};
+      float be = 0.f;
       if (s < S) {
         const int n = n_base + s;
-        const float be = beta_bhf[s];
-        krot = K_t[sl * D + d] * rope_cos[(long)n * D + d]
-             + K_t[sl * D + (d ^ 1)] * rope_sin[(long)n * D + d];
-        bV[idx] = __float2bfloat16(be * __bfloat162float(qkv_v[(long)n * sn + (long)d * sd]));
-        bKrot[idx] = __float2bfloat16(be * krot);
-      } else { bV[idx] = __float2bfloat16(0.f); bKrot[idx] = __float2bfloat16(0.f); }
-      Krot[idx] = __float2bfloat16(krot);
+        const float invrms = irms_s[sl];
+        be = beta_s[sl];
+        const float4 c4 = *reinterpret_cast<const float4*>(&rope_cos[(long)n * D + d4]);
+        const float4 s4 = *reinterpret_cast<const float4*>(&rope_sin[(long)n * D + d4]);
+        const float4 w4 = *reinterpret_cast<const float4*>(&knw[d4]);
+        const float wv[4] = {w4.x, w4.y, w4.z, w4.w};
+        const float cv[4] = {c4.x, c4.y, c4.z, c4.w};
+        const float sv[4] = {s4.x, s4.y, s4.z, s4.w};
+        float kn[4];
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          float v = __bfloat162float(Kb[sl * D + d4 + j]) * invrms * wv[j];
+          kn[j] = (v > 0.f ? v : 0.f) * k_scale;
+        }
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          kr[j] = kn[j] * cv[j] + kn[j ^ 1] * sv[j];      // d^1 within block
+          bvv[j] = be * __bfloat162float(Vb[sl * D + d4 + j]);
+        }
+      }
+      #pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        Krot[sl * D + d4 + j]  = __float2bfloat16(kr[j]);
+        bKrot[sl * D + d4 + j] = __float2bfloat16(be * kr[j]);
+        bV[sl * D + d4 + j]    = __float2bfloat16(bvv[j]);
+      }
     }
     __syncthreads();
     const bf16* bsrc = out_sel ? bV : bKrot;
@@ -232,6 +279,7 @@ __global__ __launch_bounds__(ATH_KV) void phase_a_kv_kernel(
     }
     __syncthreads();
   }
+  #undef STAGE
 
   bf16* dst = (out_sel ? A : I_P_kv) + (long)bhf * D * D;
   __shared__ float st[AW_KV][WM * WM];
@@ -560,7 +608,7 @@ void phase_a_kv(torch::Tensor qkv, torch::Tensor beta, torch::Tensor k_inv_rms,
                 torch::Tensor I_P_kv, torch::Tensor A, int F, int S, double k_scale) {
   const int B = qkv.size(0), H = qkv.size(3), BH = I_P_kv.size(0);
   auto stream = at::cuda::getCurrentCUDAStream();
-  size_t smem = sizeof(float) * (ACHUNK * D + D) + sizeof(bf16) * (3 * ACHUNK * D);
+  size_t smem = sizeof(float) * (D + 2 * ACHUNK) + sizeof(bf16) * (7 * ACHUNK * D);
   static bool s_kv = false;
   if (!s_kv) { cudaFuncSetAttribute(phase_a_kv_kernel,
       cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem); s_kv = true; }
