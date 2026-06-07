@@ -436,7 +436,19 @@ def _cam_main_triton(
     """
     import triton
 
-    from diffusion.model.ops.fused_gdn_chunkwise import cam_scan_chunkwise
+    import os as _os
+    if _os.environ.get("SANA_GDN_CUDA") == "1":
+        import sys as _sys
+        _ws = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.dirname(
+            _os.path.dirname(_os.path.abspath(__file__))))), "cuda_chunkwise_kda")
+        if _ws not in _sys.path:
+            _sys.path.insert(0, _ws)
+        try:
+            from cuda_impl import cam_scan_chunkwise_cuda as cam_scan_chunkwise
+        except Exception:
+            from diffusion.model.ops.fused_gdn_chunkwise import cam_scan_chunkwise
+    else:
+        from diffusion.model.ops.fused_gdn_chunkwise import cam_scan_chunkwise
 
     B, H, D, N = q_cam_trans.shape
     assert N == T * S, f"N={N} != T*S={T * S}"

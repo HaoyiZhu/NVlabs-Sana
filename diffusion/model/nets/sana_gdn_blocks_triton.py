@@ -33,6 +33,8 @@ raise ``NotImplementedError``:
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn as nn
 
@@ -56,6 +58,21 @@ from diffusion.model.ops.fused_gdn import (
     prepare_rope_tables,
 )
 from diffusion.model.ops.fused_gdn_chunkwise import cam_scan_bidi_chunkwise
+# Opt-in CUDA chunkwise cam scan (SANA_GDN_CUDA=1): bf16 CUDA kernels that read
+# q/k/v [B,H,D,N] directly + write the transposed output directly (no packing/
+# transpose glue). Falls back to the Triton entry for unsupported shapes/dtype.
+if os.environ.get("SANA_GDN_CUDA") == "1":
+    import sys as _sys
+    _ws = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))),
+        "cuda_chunkwise_kda")
+    if _ws not in _sys.path:
+        _sys.path.insert(0, _ws)
+    try:
+        from cuda_impl import cam_scan_bidi_chunkwise_cuda as cam_scan_bidi_chunkwise
+        print("[SANA_GDN_CUDA] using CUDA cam_scan_bidi_chunkwise")
+    except Exception as _e:
+        print(f"[SANA_GDN_CUDA] CUDA cam path unavailable ({_e}); using Triton")
 from diffusion.model.registry import ATTENTION_BLOCKS
 
 

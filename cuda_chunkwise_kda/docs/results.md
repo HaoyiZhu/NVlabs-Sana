@@ -98,6 +98,25 @@ fp32 contiguous, Triton fallback otherwise).
   overlaps B's under-utilized serial scan with C's throughput. Quantified upside
   on cam is small (~0.06 ms of 0.49 ms ≈ 1.1×) at high complexity/risk; offered.
 
+## VRAM (measured, cam path transient peak)
+| shape | Triton | CUDA | saved |
+|---|---|---|---|
+| B=1,H=20 | 547.6 MB | 14.4 MB | 533 MB (38×) |
+| B=1,H=32 | 877.1 MB | 23.1 MB | 854 MB |
+| B=4,H=20 | 2190.5 MB | 57.7 MB | 2.13 GB |
+CUDA avoids the 311MB `qkv` packing + the fp32 transpose intermediate + reuses scratch.
+
+## End-to-end (realtime demo) — scoping
+The streaming demo's GDN class `CachedChunkCausalGDNUCPESinglePathLiteLA` calls
+`cam_scan_chunkwise` (single-direction, **state-cached** AR) + the main
+`phase_a/b/c` (`fused_streaming.py`), at **fp32** (`FUSED_GDN_PRECISION=2`) — NOT
+the bidirectional bf16 path the microbenchmarks used. Integration (gated
+`SANA_GDN_CUDA=1`): `cam_scan_chunkwise_cuda` (CUDA cam_phase_a + Triton phase_b
+for cached state + CUDA cam_phase_c) wired into `fused_streaming.py:439`; the main
+scan stays Triton (its phase_c returns num/den separately, not the fused divide).
+e2e reference (121 frames, fp32 Triton): best_stream_wall 67.78s, steady-state
+realtime factor 1.02. (e2e CUDA numbers filled in by the bf16/cuda demo runs.)
+
 ## Build note
 svideo conda nvcc ships without usable headers; pip CUDA headers are fragmented.
 Build against the full system toolkit `/usr/local/cuda-12.9` (see cuda_impl.build).

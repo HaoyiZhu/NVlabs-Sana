@@ -790,6 +790,45 @@ _CAM_BUFS = {}
 _CAM_PHASE_B = os.environ.get("CAM_PHASE_B", "triton")  # "triton" (default) or "cuda"
 
 
+def cam_scan_chunkwise_cuda(q, k, v, beta, decay, *, reverse=False,
+                            init_state=None, save_final_state=False, dot_precision=None):
+    """Drop-in for fused_gdn_chunkwise.cam_scan_chunkwise (the STREAMING/cached
+    causal cam scan). CUDA cam_phase_a + cam_phase_c (read q/k/v [B,H,D,N] direct,
+    write transposed fp32 direct), Triton phase_b for the state-cached single
+    direction. bf16 GEMM. Falls back to Triton for unsupported shapes/dtype."""
+    B, H, D, N = q.shape
+    F = beta.shape[2]
+    S = N // F
+    use_cuda = (D == 128 and q.dtype == torch.float32 and N % F == 0
+                and q.is_contiguous() and k.is_contiguous() and v.is_contiguous())
+    if not use_cuda:
+        from diffusion.model.ops.fused_gdn_chunkwise import cam_scan_chunkwise
+        return cam_scan_chunkwise(q, k, v, beta, decay, reverse=reverse,
+                                  init_state=init_state, save_final_state=save_final_state,
+                                  dot_precision=dot_precision)
+    ext = build()
+    BH, BD, dev = B * H, 128, q.device
+    I_P_kv = torch.empty(BH, F, BD, BD, device=dev, dtype=torch.bfloat16)
+    A = torch.empty_like(I_P_kv)
+    ext.cam_phase_a_kv(k.contiguous(), v.contiguous(), beta.contiguous().float(), I_P_kv, A, F, S)
+    dummy = torch.empty(1, device=dev, dtype=torch.float32)
+    init_kv = init_state.to(torch.float32).contiguous() if init_state is not None else None
+    init_z = torch.zeros(BH, BD, device=dev, dtype=torch.float32) if init_state is not None else None
+    direction = 2 if reverse else 1
+    pb = phase_b_triton(I_P_kv, A, dummy, dummy, decay.contiguous(), F=F, dot_precision=0,
+                        direction=direction, init_state_kv=init_kv, init_state_z=init_z,
+                        return_final_state=save_final_state, skip_z=True)
+    if save_final_state:
+        M_fwd, _zf, M_rev, _zr, final_kv, _fz = pb
+    else:
+        M_fwd, _zf, M_rev, _zr = pb
+    M_use = M_rev if reverse else M_fwd
+    M_bf = M_use.to(torch.bfloat16).contiguous()
+    out = torch.empty(B, H, D, N, device=dev, dtype=torch.float32)
+    ext.cam_phase_c(q.contiguous(), M_bf, out, F, S)
+    return (out, final_kv) if save_final_state else out
+
+
 def run_cuda_cam(q, k, v, beta, decay, reuse_buffers=True):
     """CUDA cam path: reads q/k/v [B,H,D,N] directly, writes fp32 [B,H,D,N]
     directly (no packing, no transpose). Phase B via Triton (skip_z).
