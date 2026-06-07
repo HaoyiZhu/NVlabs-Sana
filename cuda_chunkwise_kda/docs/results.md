@@ -37,11 +37,19 @@ eliminates all of it.
 | config | end2end | speedup | notes |
 |---|---|---|---|
 | Triton cam | 4.068 ms | 1.00× | baseline (incl. packing + transpose glue) |
-| **CUDA cam** (A+C direct, Triton B) | **0.872 ms** | **4.67×** | reads q/k/v [B,H,D,N] direct, writes transposed fp32 direct; max_rel 3.9e-3 |
+| **CUDA cam** (A+C direct, Triton B) | **0.490 ms** | **8.30×** | reads q/k/v [B,H,D,N] direct, writes transposed fp32 direct, d-major coalesced staging + col-major coalesced output (ncu-guided); max_rel 3.9e-3 |
 
 Cam B-sweep (all PASS, max_rel 3.9e-3): B=1 4.07→0.87ms **4.67×**, B=4 13.54→7.91ms
-**1.71×**, B=8 27.02→13.49ms **2.00×**. (B=1 = the realtime single-stream case.
-At higher B the compute-bound Phase A GEMM dominates and narrows the gap.)
+**1.71×**, B=8 27.02→13.49ms **2.00×**. (B=1 = the realtime single-stream case.)
+
+**ncu-guided coalescing (root ncu; the box's perf-counters need admin):** ncu showed
+cam_phase_a was L1TEX-latency bound — k/v are `[B,H,D,N]` (d-major), so s-major
+staging read them strided (uncoalesced, ~64% L1). Staging **d-major** (read along N,
+coalesced; transpose moved to the wmma b-operand) cut cam_phase_a 0.528→0.270ms.
+ncu on cam_phase_c then showed it memory-bound (79% mem, MIO stalls) from the
+scattered d-major **output** write — storing the wmma tile col-major makes the write
+coalesced. **cam path B=1: 0.871 → 0.620 → 0.490 ms = 4.67× → 6.57× → 8.30×**
+(cam_phase_a 0.528→0.270, cam_phase_c 0.293→0.163; all max_rel 3.9e-3 PASS).
 
 ## Summary (validated on RTX 5090, sm_120)
 - **Full BiGDN path: 1.25×** (0.835→0.669 ms), max_rel 1.39e-2.

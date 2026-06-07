@@ -498,12 +498,14 @@ __global__ void cam_phase_c_kernel(
   }
   #pragma unroll
   for (int rt = 0; rt < ROWS / WM; ++rt) {
-    wmma::store_matrix_sync(tile_smem[warp], acc[rt], WM, wmma::mem_row_major);
+    // col-major store -> tile_smem[j*16 + s]; then consecutive lanes write
+    // consecutive n (=s) for a fixed j -> coalesced output (out is [B,H,D,N]).
+    wmma::store_matrix_sync(tile_smem[warp], acc[rt], WM, wmma::mem_col_major);
     __syncwarp();
     for (int i = lane; i < WM * WM; i += 32) {
-      const int s = s0 + rt * WM + (i >> 4);
+      const int s = s0 + rt * WM + (i & 15);
       if (s < S) {
-        const int j = ct * WM + (i & 15);
+        const int j = ct * WM + (i >> 4);
         out[qbase + (long)j * Nd + (n_base + s)] = tile_smem[warp][i];
       }
     }

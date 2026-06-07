@@ -8,8 +8,8 @@ conda activate svideo
 export HOME=/home/xieenze
 REPO=/home/xieenze/jinchengy/code/NVlabs-Sana-wm5090
 NCU=/usr/local/cuda-12.9/bin/ncu
-"$NCU" --launch-skip 40 --launch-count 2 \
-  -k "regex:phase_a_kv|cam_phase_a_kv" \
+"$NCU" --launch-skip 20 --launch-count 1 \
+  -k "regex:cam_phase_c" \
   --section SpeedOfLight --section LaunchStats --section Occupancy \
   --section WarpStateStats --section SchedulerStats \
   python "$REPO/cuda_chunkwise_kda/prof_a.py" 2>&1 | tee /tmp/ncu_a.txt

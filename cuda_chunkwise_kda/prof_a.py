@@ -22,10 +22,13 @@ rc, rs = inp["rope_cos"], inp["rope_sin"]; qkv = inp["qkv"].contiguous()
 # ---- cam-path cam_phase_a_kv ----
 q, k, v, cbeta, cdecay = make_cam_inputs(B, F, S, H, D, dev, 0)
 cIPk = torch.empty(BH, F, 128, 128, device=dev, dtype=torch.bfloat16); cA = torch.empty_like(cIPk)
-cbeta_f = cbeta.contiguous().float(); kc = k.contiguous(); vc = v.contiguous()
+cbeta_f = cbeta.contiguous().float(); kc = k.contiguous(); vc = v.contiguous(); qc = q.contiguous()
+Mbf = torch.zeros(BH, F, 128, 128, device=dev, dtype=torch.bfloat16)
+cout = torch.empty(B, H, D, F * S, device=dev, dtype=torch.float32)
 
 for _ in range(30):
     ext.phase_a_kv(qkv, beta, kir, knw, rc, rs, IPk, A, F, S, 1.0)
     ext.cam_phase_a_kv(kc, vc, cbeta_f, cIPk, cA, F, S)
+    ext.cam_phase_c(qc, Mbf, cout, F, S)
 torch.cuda.synchronize()
 print("done")
