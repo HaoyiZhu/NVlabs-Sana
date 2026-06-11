@@ -110,10 +110,16 @@ HF repo) and run:
 python inference_video_scripts/inference_sana_wm_streaming.py \
   --image       asset/sana_wm/demo_0.png \
   --prompt      asset/sana_wm/demo_0.txt \
-  --action      "w-120,lw-80,w-100,jw-80,dw-100,w-120,aw-80,w-100,jw-60,w-121" \
-  --num_frames  961 \
+  --action      "w-80,dw-40,w-80,aw-40" \
+  --num_frames  241 \                       # 15 s @ 16 fps
+  --intrinsics  asset/sana_wm/demo_0_intrinsics.npy \
   --output_dir  results/sana_wm_streaming
 ```
+
+> **Low-precision / small-GPU inference.** Add `--stage1_precision` and
+> `--refiner_precision` (`bf16` default, `fp8` for Hopper+, `fp4` for Blackwell) to
+> cut peak memory (bf16 ~47 GB → fp4 ~29 GB) and stream realtime on an RTX 5090. See
+> [Quantized Inference](#-quantized-inference-fp8--fp4) below.
 
 Output lands at `results/sana_wm_streaming/<name>_streaming.mp4` and grows in
 place — you can watch it while inference continues. Reaches **~0.93× realtime
@@ -138,6 +144,121 @@ Overrides for advanced use:
   `"1000,960,889,727,0"`), `--refiner_block_size` (3), `--refiner_kv_max_frames`
   (11) — change the canonical recipe at your own quality risk.
 
+## ⚡ Quantized Inference (fp8 / fp4)
+
+Streaming inference supports **per-component low-precision compute** so you can trade
+a little speed for a large memory reduction and run on smaller GPUs (e.g. an RTX
+5090). The **stage-1 DiT** and the **LTX-2 refiner** can each run in `bf16` (default),
+`fp8`, or `fp4`, chosen independently:
+
+```bash
+--stage1_precision  {bf16,fp8,fp4}    # stage-1 DiT
+--refiner_precision {bf16,fp8,fp4}    # LTX-2 refiner
+```
+
+| precision | format | hardware | notes |
+|-----------|--------|----------|-------|
+| `bf16` | — (default) | any | reference quality, largest memory |
+| `fp8`  | FP8 W8A8 (TE block scaling) | **Hopper (H100) or Blackwell** | broad HW support; ~half the weight memory of bf16 |
+| `fp4`  | NVFP4 W4A4 | **Blackwell only** (sm_100 / sm_120) | lowest memory — the config that fits a 32 GB 5090 |
+
+Quantization targets the self-attention, cross-attention and FFN linears, scoped per
+transformer block (`fp8`/`fp4` use the same layers — only the numeric format differs).
+Embedders and the camera branch stay in bf16.
+
+### Requirements
+
+fp8/fp4 need NVIDIA [Transformer Engine](https://github.com/NVIDIA/TransformerEngine)
+≥ 2.x (for the `Float8BlockScaling` / `NVFP4BlockScaling` recipes). **`environment_setup.sh`
+installs it by default** (skip with `SANA_SKIP_TE=1` for a faster bf16-only install).
+If TE is missing, the precision flags exit early with this install hint:
+
+```bash
+pip install --no-build-isolation 'transformer_engine[pytorch]'   # CUDA toolkit from environment_setup.sh required to build
+```
+
+bf16 needs nothing beyond the standard install.
+
+### Usage
+
+```bash
+# Hopper (H100): FP8
+--stage1_precision fp8 --refiner_precision fp8
+# Blackwell (GB200 / RTX 5090): NVFP4 (lowest memory)
+--stage1_precision fp4 --refiner_precision fp4
+```
+
+> For realtime throughput, also enable the optimized kernels via
+> `scripts/benchmark_sana_wm_5090_realtime.sh` (torch.compile VAE, flash-attn refiner,
+> fp8 KV cache, etc.); the precision flags compose with it. On aarch64 hosts pass
+> `--streaming_encoder libx264` (no NVENC).
+
+### Benchmarks
+
+**Speed = steady-state ×realtime of SANA-WM compute only** (`discard` mode excludes the
+MP4 encode / host copy; the one-time `torch.compile` warmup and Pi3X estimation are
+excluded). **Peak memory is hardware-independent** (identical tensors on H100 / GB200 /
+5090). Two refiner KV-window settings:
+
+**`--refiner_kv_max_frames 11` — default (quality)**
+
+| stage-1 / refiner | peak GPU memory | H100 (Hopper) | GB200 (Blackwell) |
+|-------------------|:---------------:|:-------------:|:-----------------:|
+| bf16 / bf16       | **47.3 GB**     | 1.09×         | 1.27×             |
+| fp8 / fp8         | **35.4 GB**     | ~1.00× *(est.)* | 1.16×           |
+| fp4 / fp4         | **29.4 GB**     | n/a (Blackwell only) | 1.16×        |
+
+**`--refiner_kv_max_frames 2` — peak speed / lowest memory**
+
+| stage-1 / refiner | peak GPU memory | H100 (Hopper) | GB200 (Blackwell) |
+|-------------------|:---------------:|:-------------:|:-----------------:|
+| bf16 / bf16       | **37.4 GB**     | 1.26×         | 1.57×             |
+| fp8 / fp8         | **25.4 GB**     | ~1.05× *(est.)* | 1.32×           |
+| fp4 / fp4         | **25.0 GB**     | n/a (Blackwell only) | 1.25×        |
+
+> ⚠️ **`kv_max_frames=2` degrades generation quality** — the small refiner KV window
+> causes visible temporal **flicker**. It is faster / smaller, but the default **`11`**
+> is recommended; `kv=2` is shown only to bound the speed/memory envelope.
+
+Notes:
+- Quantization is a **memory** optimization, not a speed one — the stage-1/refiner GEMMs
+  are latency-bound, so the TE quant path is marginally *slower* than bf16 (bf16 is
+  fastest). The payoff is the memory drop that lets it run on a 5090.
+- At `kv=11`, **fp4/fp4 (29 GB) saves ~6 GB over fp8/fp8 (35 GB)** — that gap is the
+  refiner weights (W4A4 vs W8A8); fp4 is what fits a 32 GB 5090. (At `kv=2` the two are
+  closer, ~25 GB, because activation/VAE peaks dominate.)
+- *(est.)* only the H100 fp8 cells are extrapolated (H100 bf16 × the GB200 fp8/bf16
+  ratio); everything else is measured. fp8 W8A8 is a supported Hopper feature.
+
+#### 🟢 Runs realtime on an RTX 5090 (32 GB)
+
+bf16 (47 GB) does **not** fit a 5090. At the recommended `kv=11`, **`fp4/fp4` (29 GB)
+fits** the 32 GB budget and runs **at/above realtime** on Blackwell (1.16× on GB200, the
+5090's closest proxy):
+
+```bash
+# RTX 5090 (Blackwell), quality (recommended): ~29 GB, ~realtime
+--stage1_precision fp4 --refiner_precision fp4 --refiner_kv_max_frames 11
+```
+
+(`fp8/fp8` at `kv=11` is ~35 GB — too large for a 5090; use it on Hopper/larger GPUs, or
+mix `--stage1_precision fp8 --refiner_precision fp4` to keep the refiner small.)
+
+### Picking a precision
+
+- **Quality / any GPU with ≥48 GB:** `bf16` / `bf16` (default).
+- **RTX 5090 (Blackwell, 32 GB):** `fp4` / `fp4` — the config that fits at `kv=11`.
+- **Hopper (H100, ≥40 GB):** `fp8` / `fp8` (fp4 needs Blackwell; on H100 memory isn't the
+  constraint, so fp8 is the quantized option).
+- **Mixing is allowed:** e.g. `--stage1_precision fp8 --refiner_precision fp4` keeps the
+  stage-1 backbone less noisy (fp8 flickers less than fp4 on stage-1) while the refiner
+  fp4 does most of the memory saving.
+
+> **Long rollouts (>~20 s):** the autoregressive backbone accumulates drift over very
+> long clips (motion "jumps", independent of precision — present in bf16 too). Keep clips
+> ≤ ~15–20 s or use gentler camera trajectories; this is a model-horizon property, not a
+> quantization artifact.
+
 ## 🎛️ Argument Reference
 
 | Argument | Format / Default |
@@ -160,6 +281,8 @@ Overrides for advanced use:
 | `--offload_vae` | Move the VAE to CPU between encode / decode steps. |
 | `--offload_refiner` | Lazy-load the LTX-2 refiner only when needed; release afterwards. |
 | `--sampling_algo` | `flow_euler_ltx` (default, bidirectional). For streaming use the dedicated `inference_sana_wm_streaming.py`. |
+| `--stage1_precision` | Stage-1 DiT precision: `bf16` (default) / `fp8` (Hopper+) / `fp4` (Blackwell). See [Quantized Inference](#-quantized-inference-fp8--fp4). |
+| `--refiner_precision` | LTX-2 refiner precision: `bf16` (default) / `fp8` / `fp4`. |
 
 ## 📁 HF Repository Layout
 
