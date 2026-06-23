@@ -1,8 +1,8 @@
 """Unified evaluation script for world-model benchmark.
 
 Evaluates generated videos across multiple metrics:
-1. Camera accuracy (Pi3X pose estimation vs GT)
-2. VBench visual quality (all 16 dimensions + I2V-specific + total score)
+1. VBench visual quality (benchmark custom-input dimensions + total score)
+2. Camera accuracy summary if Pi3 pose results already exist
 3. Revisit frame consistency (PSNR/SSIM between evaluation pairs)
 4. Temporal degradation (VBench on sliding windows)
 
@@ -25,8 +25,8 @@ Evaluation results are saved to:
 ```
 results/<method_name>/eval/
 ├── <split>/
-│   ├── camera_accuracy.json         # Pi3X pose metrics per scene
-│   ├── vbench_scores.json           # All VBench dimensions + total score
+│   ├── camera_accuracy.json         # Pi3 pose metrics per scene, if present
+│   ├── vbench_scores.json           # VBench dimensions + total score
 │   ├── revisit_consistency.json     # PSNR/SSIM per evaluation pair
 │   ├── temporal_degradation.json    # VBench per 10s window
 │   └── summary.json                 # Aggregated summary
@@ -60,7 +60,6 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import torch
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 sys.path.insert(0, PROJECT_ROOT)
@@ -1041,7 +1040,10 @@ def main() -> None:
         "--vbench_dims",
         nargs="+",
         default=None,
-        help="VBench dimensions. Default: all 16.",
+        help=(
+            "VBench dimensions. Default: benchmark custom-input dimensions "
+            "(7 quality dims plus overall_consistency and temporal_style)."
+        ),
     )
     parser.add_argument("--window_sec", type=float, default=10.0)
     parser.add_argument("--max_pairs", type=int, default=5)
@@ -1160,13 +1162,12 @@ def main() -> None:
     # ---- 1. VBench ----
     if "vbench" in args.metrics:
         print(f"\n{'='*60}")
-        print("VBench Visual Quality (16 dimensions + total score)")
+        print("VBench Visual Quality (benchmark custom-input dimensions + total score)")
         print(f"{'='*60}")
-        dims = args.vbench_dims or VBENCH_ALL_DIMS
         vbench_results = eval_vbench(
             video_dir,
             eval_dir,
-            dimensions=dims,
+            dimensions=args.vbench_dims,
             device=args.device,
             benchmark_meta=benchmark_meta,
             benchmark_manifest=benchmark_manifest,
