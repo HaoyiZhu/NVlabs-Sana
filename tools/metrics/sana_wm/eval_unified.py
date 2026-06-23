@@ -51,6 +51,7 @@ python tools/metrics/sana_wm/eval_unified.py \\
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -307,6 +308,43 @@ def _detect_video_fps(video_path: str) -> float:
     return 16.0  # Default fallback
 
 
+def _frame_to_numpy(frame) -> np.ndarray:
+    """Convert a decord/imageio/torch frame object to a numpy array."""
+    if hasattr(frame, "asnumpy"):
+        return frame.asnumpy()
+    if isinstance(frame, np.ndarray):
+        return frame
+    if hasattr(frame, "detach") and hasattr(frame, "cpu"):
+        return frame.detach().cpu().numpy()
+    if hasattr(frame, "numpy"):
+        return frame.numpy()
+    return np.asarray(frame)
+
+
+@contextlib.contextmanager
+def _vbench_torch_load_compat():
+    """Allow official VBench checkpoints to load under PyTorch 2.6+.
+
+    PyTorch 2.6 changed ``torch.load`` to default to ``weights_only=True``.
+    Some official VBench checkpoints still serialize plain Python containers
+    that are rejected by that safer default. During VBench's own model loading,
+    opt back into the pre-2.6 behavior for those trusted public checkpoints.
+    """
+    import torch
+
+    original_load = torch.load
+
+    def compat_load(*args, **kwargs):
+        kwargs.setdefault("weights_only", False)
+        return original_load(*args, **kwargs)
+
+    torch.load = compat_load
+    try:
+        yield
+    finally:
+        torch.load = original_load
+
+
 _LPIPS_MODEL = None
 
 
@@ -441,8 +479,8 @@ def eval_revisit_consistency(
                         scene_lpips_local.append(p["lpips"])
                         continue
                     if VideoReader is not None:
-                        img_a = vr_local[fa].asnumpy()
-                        img_b = vr_local[fb].asnumpy()
+                        img_a = _frame_to_numpy(vr_local[fa])
+                        img_b = _frame_to_numpy(vr_local[fb])
                     else:
                         img_a = frames_local[fa]
                         img_b = frames_local[fb]
@@ -493,8 +531,8 @@ def eval_revisit_consistency(
                 continue  # Degenerate after remap
 
             if VideoReader is not None:
-                img_a = vr[fa].asnumpy()
-                img_b = vr[fb].asnumpy()
+                img_a = _frame_to_numpy(vr[fa])
+                img_b = _frame_to_numpy(vr[fb])
             else:
                 img_a = frames_all[fa]
                 img_b = frames_all[fb]
@@ -618,7 +656,7 @@ def _build_stripped_video_dir(video_dir: str, output_dir: str) -> str:
         try:
             if _have_decord:
                 vr = VideoReader(str(src))
-                frames = vr[1:].asnumpy()
+                frames = _frame_to_numpy(vr[1:])
             else:
                 frames_all = iio.imread(str(src))
                 frames = frames_all[1:]
@@ -791,13 +829,15 @@ def eval_vbench(
         t0 = time.time()
         try:
             bench = VBench(device, vbench_info_path, output_dir)
-            bench.evaluate(
-                videos_path=str(video_dir),
-                name=f"eval_{dim}",
-                dimension_list=[dim],
-                mode="custom_input",
-                prompt_list=prompt_list,
-            )
+            with _vbench_torch_load_compat():
+                bench.evaluate(
+                    videos_path=str(video_dir),
+                    name=f"eval_{dim}",
+                    dimension_list=[dim],
+                    mode="custom_input",
+                    prompt_list=prompt_list,
+                    local=(dim == "subject_consistency"),
+                )
 
             # Check both naming patterns
             result_file = None
@@ -824,6 +864,10 @@ def eval_vbench(
                 print(f"result file not found ({time.time()-t0:.1f}s)")
         except Exception as e:
             print(f"FAILED: {e}")
+
+    missing = [dim for dim in dimensions if dim not in scores]
+    if missing:
+        raise RuntimeError(f"VBench failed for requested dimension(s): {', '.join(missing)}")
 
     return scores
 
@@ -966,7 +1010,7 @@ def eval_temporal_degradation(
 
             clip_path = os.path.join(window_dir, f"{scene_id}_generated.mp4")
             if not os.path.exists(clip_path):
-                frames = vr[start:end].asnumpy()
+                frames = _frame_to_numpy(vr[start:end])
                 iio.imwrite(clip_path, frames, fps=int(fps))
 
             window_dirs.setdefault(window_name, window_dir)
