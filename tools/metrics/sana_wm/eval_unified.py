@@ -91,6 +91,18 @@ def _load_manifest_prompts(manifest_path: str | None) -> dict[str, str]:
     return prompts
 
 
+def _resolve_vbench_info_path(vbench_module) -> str:
+    """Find VBench_full_info.json for either source-tree or pip-installed VBench."""
+    candidates = [
+        Path(PROJECT_ROOT) / "local_libs" / "VBench" / "vbench" / "VBench_full_info.json",
+        Path(vbench_module.__file__).resolve().parent / "VBench_full_info.json",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    raise FileNotFoundError("Could not find VBench_full_info.json. Install VBench or provide local_libs/VBench.")
+
+
 # ============================================================================
 # VBench dimension definitions (all 16 from VBench 1.0)
 # ============================================================================
@@ -650,9 +662,15 @@ def eval_vbench(
     sys.path.insert(0, vbench_root)
 
     try:
+        import vbench as vbench_module
         from vbench import VBench
     except ImportError:
         print("ERROR: VBench not importable. Ensure local_libs/VBench is available.")
+        return {}
+    try:
+        vbench_info_path = _resolve_vbench_info_path(vbench_module)
+    except FileNotFoundError as exc:
+        print(f"ERROR: {exc}")
         return {}
 
     if dimensions is None:
@@ -773,7 +791,7 @@ def eval_vbench(
         print(f"  [{skipped+i+1}/{len(dimensions)}] {dim} ...", end=" ", flush=True)
         t0 = time.time()
         try:
-            bench = VBench(device, os.path.join(vbench_root, "vbench", "VBench_full_info.json"), output_dir)
+            bench = VBench(device, vbench_info_path, output_dir)
             bench.evaluate(
                 videos_path=str(video_dir),
                 name=f"eval_{dim}",

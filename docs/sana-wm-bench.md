@@ -68,6 +68,28 @@ The rest of this guide assumes:
 BENCH=data/SANA-WM-Bench
 ```
 
+## Evaluation Dependencies
+
+Run the benchmark from a Sana-WM runtime environment with the extra evaluation
+packages installed:
+
+```bash
+python -m pip install vbench decord lpips
+```
+
+Camera pose accuracy additionally requires Pi3 to be importable:
+
+```bash
+python - <<'PY'
+from pi3.models.pi3 import Pi3
+print("Pi3 OK")
+PY
+```
+
+If the inference environment has strict package pins, keep the VBench/LPIPS
+extras in a separate evaluation environment or user site and use the same
+repository checkout and result directory.
+
 ## Run One Scene
 
 Download or point `BENCH` at the release directory:
