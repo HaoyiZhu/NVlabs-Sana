@@ -74,7 +74,7 @@ Run the benchmark from a Sana-WM runtime environment with the extra evaluation
 packages installed:
 
 ```bash
-python -m pip install vbench decord lpips
+python -m pip install vbench decord lpips pyiqa==0.1.10 facexlib==0.3.0
 ```
 
 Camera pose accuracy additionally requires Pi3 to be importable:
@@ -89,6 +89,10 @@ PY
 If the inference environment has strict package pins, keep the VBench/LPIPS
 extras in a separate evaluation environment or user site and use the same
 repository checkout and result directory.
+
+The first VBench/LPIPS run downloads the official evaluation weights into the
+user cache, including DINO, AMT, ViCLIP, and AlexNet checkpoints. Make sure the
+evaluation job has network access or a pre-populated cache.
 
 ## Run One Scene
 
