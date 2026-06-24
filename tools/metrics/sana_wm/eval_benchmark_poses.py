@@ -15,7 +15,6 @@ import argparse
 import json
 import os
 import sys
-import warnings
 from glob import glob
 from typing import Dict
 

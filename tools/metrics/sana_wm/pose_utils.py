@@ -106,9 +106,7 @@ def metric(c2w_1: Tensor, c2w_2: Tensor) -> tuple[float, float, float]:
     """Compute aligned rotation, translation, and camera-motion errors."""
     w2c_1 = closed_form_inverse_se3(c2w_1)
     w2c_2 = closed_form_inverse_se3(c2w_2)
-    align_t_r, align_t_t, align_t_s = align_camera_extrinsics(
-        w2c_2[:, :3, :4], w2c_1[:, :3, :4], estimate_scale=True
-    )
+    align_t_r, align_t_t, align_t_s = align_camera_extrinsics(w2c_2[:, :3, :4], w2c_1[:, :3, :4], estimate_scale=True)
     r_tgt, t_tgt = apply_transformation(w2c_2[:, :3, :4], align_t_r, align_t_t, align_t_s, return_extri=False)
     w2c_2_align = torch.cat([r_tgt, t_tgt.unsqueeze(-1)], dim=-1)
     c2w_2 = closed_form_inverse_se3(w2c_2_align)
@@ -148,7 +146,9 @@ def run_pi3_inference_batch(model, video_paths, device, interval=1):
     first_shape = imgs_list[0].shape
     can_batch = all(img.shape == first_shape for img in imgs_list)
     results_map = {}
-    dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+    dtype = (
+        torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+    )
 
     if can_batch:
         try:
